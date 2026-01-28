@@ -1,0 +1,215 @@
+"""MCPServer quickstart example with Yandex.Weather tool.
+
+Run from the repository root:
+    uv run mcp-server-demo/mcpserver_quickstart.py
+"""
+
+import os
+from typing import Any, cast
+
+import httpx
+from dotenv import load_dotenv
+from mcp.server.mcpserver import MCPServer
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Create an MCP server
+mcp = MCPServer("Demo")
+
+# Словарь для перевода состояний погоды на русский
+WEATHER_CONDITIONS_RU: dict[str, str] = {
+    "clear": "ясно",
+    "partly-cloudy": "малооблачно",
+    "cloudy": "облачно с прояснениями",
+    "overcast": "пасмурно",
+    "drizzle": "морось",
+    "light-rain": "небольшой дождь",
+    "rain": "дождь",
+    "moderate-rain": "умеренно сильный дождь",
+    "heavy-rain": "сильный дождь",
+    "continuous-heavy-rain": "длительный сильный дождь",
+    "showers": "ливень",
+    "wet-snow": "дождь со снегом",
+    "light-snow": "небольшой снег",
+    "snow": "снег",
+    "snow-showers": "снегопад",
+    "hail": "град",
+    "thunderstorm": "гроза",
+    "thunderstorm-with-rain": "гроза с дождём",
+    "thunderstorm-with-hail": "гроза с градом",
+}
+
+
+# Add an addition tool
+@mcp.tool()
+def add(a: int, b: int) -> int:
+    """Add two numbers"""
+    return a + b
+
+
+# Add a weather tool backed by Yandex.Weather
+@mcp.tool()
+async def get_weather(city: str, unit: str = "celsius") -> str:
+    """Get real weather for a city using Yandex.Weather.
+
+    Reads API key from YANDEX_WEATHER_API_KEY environment variable and:
+    1) Resolves the city name to coordinates via Yandex Geocoder.
+    2) Queries current weather from Yandex.Weather API.
+    """
+    city = (city or "").strip()
+    if not city:
+        return "Город не указан."
+
+    api_key = os.getenv("YANDEX_WEATHER_API_KEY", "").strip()
+    if not api_key:
+        return "YANDEX_WEATHER_API_KEY не задан в переменных окружения."
+
+    unit = (unit or "celsius").strip().lower()
+    unit_label = "°C" if unit.startswith("c") else "°F"
+
+    # --- 1. Геокодер: город -> координаты (используем Nominatim от OpenStreetMap) ---
+    # Это бесплатный геокодер, не требует API ключа
+    geocode_url = "https://nominatim.openstreetmap.org/search"
+    geocode_params = {
+        "q": city,
+        "format": "json",
+        "limit": 1,
+        "accept-language": "ru",
+    }
+    geocode_headers = {
+        "User-Agent": "MCP-Weather-Server/1.0",  # Требуется Nominatim
+    }
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            geo_resp = await client.get(
+                geocode_url, params=geocode_params, headers=geocode_headers
+            )
+            geo_resp.raise_for_status()
+            geo_data_raw: Any = geo_resp.json()
+        except Exception as e:
+            return f"Ошибка геокодера для города '{city}': {e}"
+
+        try:
+            if (
+                not geo_data_raw
+                or not isinstance(geo_data_raw, list)
+                or len(geo_data_raw) == 0  # type: ignore[arg-type]
+            ):
+                return f"Город '{city}' не найден."
+
+            geo_data = cast(list[dict[str, Any]], geo_data_raw)
+            first_result: dict[str, Any] = geo_data[0]
+            lat: str | None = first_result.get("lat")
+            lon: str | None = first_result.get("lon")
+
+            if not lat or not lon:
+                return f"Не удалось получить координаты для города '{city}'."
+        except Exception as e:
+            return f"Не удалось разобрать координаты города '{city}': {e}"
+
+        # --- 2. Погода по координатам ---
+        weather_url = "https://api.weather.yandex.ru/v2/forecast"
+        weather_params: dict[str, Any] = {
+            "lat": lat,
+            "lon": lon,
+            "limit": 1,
+            "hours": False,
+            "lang": "ru_RU",
+        }
+        weather_headers = {
+            "X-Yandex-Weather-Key": api_key,
+        }
+
+        try:
+            w_resp = await client.get(
+                weather_url,
+                params=weather_params,
+                headers=weather_headers,
+            )
+            w_resp.raise_for_status()
+            w_data: dict[str, Any] = w_resp.json()
+        except Exception as e:
+            return f"Ошибка запроса к API Яндекс.Погоды: {e}"
+
+    try:
+        fact = w_data["fact"]
+        temp_c = fact.get("temp")
+        condition_en = fact.get("condition", "нет данных")
+        # Переводим состояние на русский
+        condition = WEATHER_CONDITIONS_RU.get(
+            condition_en, condition_en
+        )  # Если нет в словаре, оставляем как есть
+        humidity = fact.get("humidity")
+        wind_speed = fact.get("wind_speed")
+    except Exception as e:
+        return f"Не удалось распарсить ответ Яндекс.Погоды: {e}"
+
+    # Переводим в °F, если запрошена не цельсия
+    if temp_c is not None and not unit.startswith("c"):
+        try:
+            temp_c = float(temp_c)
+            temp = round((temp_c * 9 / 5) + 32)
+        except Exception:
+            temp = temp_c
+    else:
+        temp = temp_c
+
+    parts = [
+        f"Погода в {city}: {temp}{unit_label}",
+        f"Состояние: {condition}",
+    ]
+    if humidity is not None:
+        parts.append(f"Влажность: {humidity}%")
+    if wind_speed is not None:
+        parts.append(f"Ветер: {wind_speed} м/с")
+
+    return "; ".join(parts)
+
+
+# Add a dynamic greeting resource
+@mcp.resource("greeting://{name}")
+def get_greeting(name: str) -> str:
+    """Get a personalized greeting"""
+    return f"Hello, {name}!"
+
+
+# Add a prompt
+@mcp.prompt()
+def greet_user(name: str, style: str = "friendly") -> str:
+    """Generate a greeting prompt"""
+    styles = {
+        "friendly": "Please write a warm, friendly greeting",
+        "formal": "Please write a formal, professional greeting",
+        "casual": "Please write a casual, relaxed greeting",
+    }
+
+    return f"{styles.get(style, styles['friendly'])} for someone named {name}."
+
+
+# Run with streamable HTTP transport
+if __name__ == "__main__":
+    # If you connect from a browser-based client (like MCP Inspector in "Direct" mode),
+    # you must enable CORS and expose the Mcp-Session-Id header.
+    from starlette.middleware.cors import CORSMiddleware
+
+    import uvicorn
+
+    # IMPORTANT: Do not mount the returned app into another Starlette app.
+    # The Streamable HTTP transport relies on the Starlette lifespan to run
+    # its internal session manager (task group). If you mount it, the mounted
+    # app's lifespan won't run and you'll get:
+    # "Task group is not initialized. Make sure to use run()."
+    #
+    # Endpoint will be available at http://127.0.0.1:8000/mcp
+    app = mcp.streamable_http_app(json_response=True)
+
+    app = CORSMiddleware(
+        app,
+        allow_origins=["*"],
+        allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+        expose_headers=["Mcp-Session-Id"],
+    )
+
+    uvicorn.run(app, host="127.0.0.1", port=8000)

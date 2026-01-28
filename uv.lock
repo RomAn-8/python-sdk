@@ -10,6 +10,7 @@ resolution-markers = [
 members = [
     "mcp",
     "mcp-everything-server",
+    "mcp-server-demo",
     "mcp-simple-auth",
     "mcp-simple-auth-client",
     "mcp-simple-chatbot",
@@ -856,6 +857,17 @@ dev = [
     { name = "pytest", specifier = ">=8.3.3" },
     { name = "ruff", specifier = ">=0.6.9" },
 ]
+
+[[package]]
+name = "mcp-server-demo"
+version = "0.1.0"
+source = { virtual = "mcp-server-demo" }
+dependencies = [
+    { name = "mcp", extra = ["cli"] },
+]
+
+[package.metadata]
+requires-dist = [{ name = "mcp", extras = ["cli"], editable = "." }]
 
 [[package]]
 name = "mcp-simple-auth"

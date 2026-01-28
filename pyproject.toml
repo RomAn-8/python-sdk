@@ -160,7 +160,12 @@ max-returns = 13                                           # Default is 6
 max-statements = 102                                       # Default is 50
 
 [tool.uv.workspace]
-members = ["examples/clients/*", "examples/servers/*", "examples/snippets"]
+members = [
+    "examples/clients/*",
+    "examples/servers/*",
+    "examples/snippets",
+    "mcp-server-demo",
+]
 
 [tool.uv.sources]
 mcp = { workspace = true }
