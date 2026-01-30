@@ -168,6 +168,96 @@ async def get_weather(city: str, unit: str = "celsius") -> str:
     return "; ".join(parts)
 
 
+# Add a news tool backed by NewsAPI
+@mcp.tool()
+async def get_news(topic: str, count: int = 5) -> str:
+    """Get news articles on a specific topic using NewsAPI.
+    
+    Reads API key from NEWSAPI_KEY environment variable and:
+    1) Queries NewsAPI for articles matching the topic.
+    2) Returns top news articles in Russian language.
+    
+    Args:
+        topic: News topic to search for (e.g., "технологии", "политика", "спорт")
+        count: Number of articles to return (default: 5, max: 100)
+    """
+    topic = (topic or "").strip()
+    if not topic:
+        return "Тема новостей не указана."
+    
+    api_key = os.getenv("NEWSAPI_KEY", "").strip()
+    if not api_key:
+        return "NEWSAPI_KEY не задан в переменных окружения."
+    
+    # Ограничиваем количество новостей
+    count = max(1, min(count, 100))
+    
+    # NewsAPI endpoint для поиска новостей
+    news_url = "https://newsapi.org/v2/everything"
+    news_params = {
+        "q": topic,
+        "language": "ru",
+        "sortBy": "publishedAt",
+        "pageSize": count,
+        "apiKey": api_key,
+    }
+    
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            news_resp = await client.get(news_url, params=news_params)
+            news_resp.raise_for_status()
+            news_data: dict[str, Any] = news_resp.json()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 401:
+                return "Ошибка авторизации NewsAPI. Проверьте API ключ."
+            elif e.response.status_code == 429:
+                return "Превышен лимит запросов к NewsAPI. Попробуйте позже."
+            return f"Ошибка запроса к NewsAPI: {e}"
+        except Exception as e:
+            return f"Ошибка при запросе новостей: {e}"
+    
+    try:
+        articles = news_data.get("articles", [])
+        if not articles:
+            return f"Новости по теме '{topic}' не найдены."
+        
+        # Формируем список новостей
+        news_list: list[str] = []
+        for i, article in enumerate(articles[:count], 1):
+            title = article.get("title", "Без заголовка")
+            description = article.get("description", "")
+            url = article.get("url", "")
+            source = article.get("source", {}).get("name", "Неизвестный источник")
+            published = article.get("publishedAt", "")
+            
+            # Форматируем дату (если есть)
+            date_str = ""
+            if published:
+                try:
+                    from datetime import datetime
+                    dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
+                    date_str = dt.strftime("%d.%m.%Y %H:%M")
+                except Exception:
+                    date_str = published[:10] if len(published) >= 10 else ""
+            
+            news_item = f"{i}. {title}"
+            if description:
+                news_item += f"\n   {description[:200]}{'...' if len(description) > 200 else ''}"
+            if source:
+                news_item += f"\n   Источник: {source}"
+            if date_str:
+                news_item += f" ({date_str})"
+            if url:
+                news_item += f"\n   {url}"
+            
+            news_list.append(news_item)
+        
+        return "\n\n".join(news_list)
+    
+    except Exception as e:
+        return f"Не удалось обработать ответ NewsAPI: {e}"
+
+
 # Add a dynamic greeting resource
 @mcp.resource("greeting://{name}")
 def get_greeting(name: str) -> str:

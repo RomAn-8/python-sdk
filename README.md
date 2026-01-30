@@ -1,4 +1,4 @@
-# MCP Python SDK
+# MCP Python SDK uv run --with mcp mcp-server-demo/mcpserver_quickstart.py
 
 <div align="center">
 
