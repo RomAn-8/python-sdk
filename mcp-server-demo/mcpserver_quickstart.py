@@ -4,7 +4,9 @@ Run from the repository root:
     uv run mcp-server-demo/mcpserver_quickstart.py
 """
 
+import asyncio
 import os
+from pathlib import Path
 from typing import Any, cast
 
 import httpx
@@ -256,6 +258,246 @@ async def get_news(topic: str, count: int = 5) -> str:
     
     except Exception as e:
         return f"Не удалось обработать ответ NewsAPI: {e}"
+
+
+# Docker container management tools
+DOCKER_WEB_DIR = Path(r"D:\vetonline\consultvet\docker-web")
+DOCKER_SHOT_DIR = Path(r"D:\vetonline\consultvet\docker-shot")
+SCREENSHOTS_DIR = Path(r"D:\vetonline\consultvet\screenshots")
+CONTAINER_NAME = "consultvet-web"
+IMAGE_WEB = "consultvet-web"
+IMAGE_SHOT = "consultvet-shot"
+SITE_URL = "http://localhost:8080"
+SITE_URL_DOCKER = "http://host.docker.internal:8080"
+
+
+@mcp.tool()
+async def site_up() -> str:
+    """Поднимает Docker контейнер сайта consultvet-web.
+    
+    Выполняет docker compose up -d web (или docker run) для поднятия контейнера.
+    Затем делает healthcheck (HTTP 200) и возвращает статус + URL.
+    
+    Returns:
+        Строка с результатом операции и URL сайта (например, http://localhost:8080)
+    """
+    try:
+        # Проверяем, есть ли docker-compose.yml в папке docker-web
+        compose_file = DOCKER_WEB_DIR / "docker-compose.yml"
+        
+        if compose_file.exists():
+            # Используем docker compose
+            process = await asyncio.create_subprocess_exec(
+                "docker",
+                "compose",
+                "up",
+                "-d",
+                "web",
+                cwd=str(DOCKER_WEB_DIR),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                error_msg = stderr.decode("utf-8", errors="ignore") if stderr else "Неизвестная ошибка"
+                return f"Ошибка при поднятии контейнера через docker compose: {error_msg}"
+        else:
+            # Используем docker run
+            # Проверяем, запущен ли уже контейнер
+            check_running = await asyncio.create_subprocess_exec(
+                "docker",
+                "ps",
+                "--filter",
+                f"name={CONTAINER_NAME}",
+                "--format",
+                "{{.Names}}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            check_running_stdout, _ = await check_running.communicate()
+            is_running = CONTAINER_NAME in check_running_stdout.decode("utf-8", errors="ignore")
+            
+            if is_running:
+                # Контейнер уже запущен, проверяем healthcheck
+                pass
+            else:
+                # Проверяем, существует ли контейнер (но остановлен)
+                check_exists = await asyncio.create_subprocess_exec(
+                    "docker",
+                    "ps",
+                    "-a",
+                    "--filter",
+                    f"name={CONTAINER_NAME}",
+                    "--format",
+                    "{{.Names}}",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                check_exists_stdout, _ = await check_exists.communicate()
+                exists = CONTAINER_NAME in check_exists_stdout.decode("utf-8", errors="ignore")
+                
+                if exists:
+                    # Контейнер существует, но остановлен - запускаем его
+                    process = await asyncio.create_subprocess_exec(
+                        "docker",
+                        "start",
+                        CONTAINER_NAME,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    stdout, stderr = await process.communicate()
+                    
+                    if process.returncode != 0:
+                        error_msg = stderr.decode("utf-8", errors="ignore") if stderr else "Неизвестная ошибка"
+                        return f"Ошибка при запуске существующего контейнера: {error_msg}"
+                else:
+                    # Контейнера нет - создаём новый
+                    process = await asyncio.create_subprocess_exec(
+                        "docker",
+                        "run",
+                        "-d",
+                        "--name",
+                        CONTAINER_NAME,
+                        "-p",
+                        "8080:80",
+                        IMAGE_WEB,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    stdout, stderr = await process.communicate()
+                    
+                    if process.returncode != 0:
+                        error_msg = stderr.decode("utf-8", errors="ignore") if stderr else "Неизвестная ошибка"
+                        return f"Ошибка при создании контейнера через docker run: {error_msg}"
+        
+        # Ждём немного, чтобы контейнер успел запуститься
+        await asyncio.sleep(3)
+        
+        # Делаем healthcheck
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(SITE_URL)
+                if response.status_code == 200:
+                    return f"✅ Сайт успешно поднят. URL: {SITE_URL}"
+                else:
+                    return f"⚠️ Контейнер запущен, но сайт вернул статус {response.status_code}. URL: {SITE_URL}"
+        except httpx.RequestError as e:
+            return f"⚠️ Контейнер запущен, но healthcheck не прошёл: {e}. URL: {SITE_URL}"
+        except Exception as e:
+            return f"⚠️ Контейнер запущен, но ошибка при проверке: {e}. URL: {SITE_URL}"
+            
+    except Exception as e:
+        return f"Ошибка при поднятии сайта: {e}"
+
+
+@mcp.tool()
+async def site_screenshot() -> str:
+    """Создаёт скриншот сайта через одноразовый Docker контейнер.
+    
+    Запускает контейнер consultvet-shot, который открывает сайт,
+    сохраняет PNG в примонтированную папку и завершает работу.
+    
+    Returns:
+        Путь к сохранённому PNG файлу (например, D:\\vetonline\\consultvet\\screenshots\\site.png)
+    """
+    try:
+        # Создаём папку для скриншотов, если её нет
+        SCREENSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+        
+        screenshot_path = SCREENSHOTS_DIR / "site.png"
+        
+        # Запускаем одноразовый контейнер для скриншота
+        # Монтируем папку скриншотов в контейнер
+        # Скрипт screenshot.py ожидает: <url> <output_png>
+        # output_png должен быть полным путём внутри контейнера: /screenshots/site.png
+        process = await asyncio.create_subprocess_exec(
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{SCREENSHOTS_DIR}:/screenshots",
+            IMAGE_SHOT,
+            SITE_URL_DOCKER,  # URL сайта внутри контейнера (http://host.docker.internal:8080)
+            "/screenshots/site.png",  # Полный путь к файлу внутри контейнера
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        
+        # Декодируем вывод для отладки
+        stdout_text = stdout.decode("utf-8", errors="ignore") if stdout else ""
+        stderr_text = stderr.decode("utf-8", errors="ignore") if stderr else ""
+        
+        if process.returncode != 0:
+            error_details = f"STDOUT: {stdout_text}\nSTDERR: {stderr_text}" if (stdout_text or stderr_text) else "Неизвестная ошибка"
+            return f"Ошибка при создании скриншота (код {process.returncode}):\n{error_details}"
+        
+        # Проверяем, что файл создан
+        if screenshot_path.exists():
+            return str(screenshot_path)
+        else:
+            # Если файл не создан, но процесс завершился успешно, выводим логи для отладки
+            debug_info = f"STDOUT: {stdout_text}\nSTDERR: {stderr_text}" if (stdout_text or stderr_text) else ""
+            return f"⚠️ Скриншот не был создан по пути {screenshot_path}.\n{debug_info}"
+            
+    except Exception as e:
+        return f"Ошибка при создании скриншота: {e}"
+
+
+@mcp.tool()
+async def site_down() -> str:
+    """Останавливает Docker контейнер сайта consultvet-web.
+    
+    Выполняет docker compose stop web (или docker stop) для остановки контейнера.
+    
+    Returns:
+        Строка с результатом операции
+    """
+    try:
+        # Проверяем, есть ли docker-compose.yml в папке docker-web
+        compose_file = DOCKER_WEB_DIR / "docker-compose.yml"
+        
+        if compose_file.exists():
+            # Используем docker compose
+            process = await asyncio.create_subprocess_exec(
+                "docker",
+                "compose",
+                "stop",
+                "web",
+                cwd=str(DOCKER_WEB_DIR),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                error_msg = stderr.decode("utf-8", errors="ignore") if stderr else "Неизвестная ошибка"
+                return f"Ошибка при остановке контейнера через docker compose: {error_msg}"
+            
+            return "✅ Сайт остановлен (docker compose stop web)"
+        else:
+            # Используем docker stop
+            process = await asyncio.create_subprocess_exec(
+                "docker",
+                "stop",
+                CONTAINER_NAME,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await process.communicate()
+            
+            if process.returncode != 0:
+                error_msg = stderr.decode("utf-8", errors="ignore") if stderr else "Неизвестная ошибка"
+                # Если контейнер не найден, это тоже нормально
+                if "No such container" in error_msg or "not found" in error_msg.lower():
+                    return "ℹ️ Контейнер не был запущен"
+                return f"Ошибка при остановке контейнера: {error_msg}"
+            
+            return "✅ Сайт остановлен (docker stop)"
+            
+    except Exception as e:
+        return f"Ошибка при остановке сайта: {e}"
 
 
 # Add a dynamic greeting resource
