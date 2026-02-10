@@ -558,6 +558,147 @@ async def git_branch(repo_path: str | None = None) -> str:
         return f"Ошибка при получении текущей ветки: {e}"
 
 
+@mcp.tool()
+async def get_pr_diff(owner: str, repo: str, pr_number: int, github_token: str) -> str:
+    """Получить diff (unified diff) для Pull Request через GitHub API.
+    
+    Args:
+        owner: Владелец репозитория (например, "RomAn-8")
+        repo: Название репозитория (например, "nikita_ai")
+        pr_number: Номер PR
+        github_token: GitHub Personal Access Token или GITHUB_TOKEN
+    
+    Returns:
+        Unified diff строка или сообщение об ошибке
+    """
+    try:
+        url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
+        headers = {
+            "Accept": "application/vnd.github.v3.diff",
+            "Authorization": f"token {github_token}",
+            "User-Agent": "MCP-GitHub-Tool/1.0",
+        }
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
+            return response.text
+            
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            return f"Ошибка: PR #{pr_number} не найден в репозитории {owner}/{repo}"
+        elif e.response.status_code == 401:
+            return "Ошибка: Неверный GitHub token (401 Unauthorized)"
+        return f"Ошибка GitHub API: {e.response.status_code} - {e.response.text}"
+    except Exception as e:
+        return f"Ошибка при получении diff PR: {e}"
+
+
+@mcp.tool()
+async def get_pr_files(owner: str, repo: str, pr_number: int, github_token: str) -> str:
+    """Получить список измененных файлов в Pull Request через GitHub API.
+    
+    Args:
+        owner: Владелец репозитория (например, "RomAn-8")
+        repo: Название репозитория (например, "nikita_ai")
+        pr_number: Номер PR
+        github_token: GitHub Personal Access Token или GITHUB_TOKEN
+    
+    Returns:
+        JSON строка со списком файлов и их статусами (added, modified, removed) или сообщение об ошибке
+    """
+    try:
+        url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}/files"
+        headers = {
+            "Accept": "application/vnd.github.v3+json",
+            "Authorization": f"token {github_token}",
+            "User-Agent": "MCP-GitHub-Tool/1.0",
+        }
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
+            files_data = response.json()
+            
+            # Форматируем результат для удобства
+            result = []
+            for file_info in files_data:
+                result.append({
+                    "filename": file_info.get("filename", ""),
+                    "status": file_info.get("status", ""),  # added, modified, removed, renamed
+                    "additions": file_info.get("additions", 0),
+                    "deletions": file_info.get("deletions", 0),
+                    "changes": file_info.get("changes", 0),
+                    "patch": file_info.get("patch", ""),  # небольшой патч для контекста
+                })
+            
+            import json
+            return json.dumps(result, ensure_ascii=False, indent=2)
+            
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            return f"Ошибка: PR #{pr_number} не найден в репозитории {owner}/{repo}"
+        elif e.response.status_code == 401:
+            return "Ошибка: Неверный GitHub token (401 Unauthorized)"
+        return f"Ошибка GitHub API: {e.response.status_code} - {e.response.text}"
+    except Exception as e:
+        return f"Ошибка при получении файлов PR: {e}"
+
+
+@mcp.tool()
+async def get_pr_info(owner: str, repo: str, pr_number: int, github_token: str) -> str:
+    """Получить метаинформацию о Pull Request через GitHub API.
+    
+    Args:
+        owner: Владелец репозитория (например, "RomAn-8")
+        repo: Название репозитория (например, "nikita_ai")
+        pr_number: Номер PR
+        github_token: GitHub Personal Access Token или GITHUB_TOKEN
+    
+    Returns:
+        JSON строка с информацией о PR (title, description, author, branches) или сообщение об ошибке
+    """
+    try:
+        url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{pr_number}"
+        headers = {
+            "Accept": "application/vnd.github.v3+json",
+            "Authorization": f"token {github_token}",
+            "User-Agent": "MCP-GitHub-Tool/1.0",
+        }
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
+            pr_data = response.json()
+            
+            # Извлекаем нужную информацию
+            result = {
+                "number": pr_data.get("number"),
+                "title": pr_data.get("title", ""),
+                "body": pr_data.get("body", ""),
+                "state": pr_data.get("state", ""),  # open, closed
+                "author": pr_data.get("user", {}).get("login", ""),
+                "base_branch": pr_data.get("base", {}).get("ref", ""),
+                "head_branch": pr_data.get("head", {}).get("ref", ""),
+                "created_at": pr_data.get("created_at", ""),
+                "updated_at": pr_data.get("updated_at", ""),
+                "mergeable": pr_data.get("mergeable"),
+                "draft": pr_data.get("draft", False),
+            }
+            
+            import json
+            return json.dumps(result, ensure_ascii=False, indent=2)
+            
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 404:
+            return f"Ошибка: PR #{pr_number} не найден в репозитории {owner}/{repo}"
+        elif e.response.status_code == 401:
+            return "Ошибка: Неверный GitHub token (401 Unauthorized)"
+        return f"Ошибка GitHub API: {e.response.status_code} - {e.response.text}"
+    except Exception as e:
+        return f"Ошибка при получении информации о PR: {e}"
+
+
 # Add a dynamic greeting resource
 @mcp.resource("greeting://{name}")
 def get_greeting(name: str) -> str:
