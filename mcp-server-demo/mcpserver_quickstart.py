@@ -500,6 +500,50 @@ async def site_down() -> str:
         return f"Ошибка при остановке сайта: {e}"
 
 
+@mcp.tool()
+async def git_branch() -> str:
+    """Получить текущую ветку git-репозитория.
+    
+    Выполняет команду 'git branch --show-current' в корне репозитория python-sdk
+    и возвращает название активной ветки.
+    
+    Returns:
+        Название текущей ветки или сообщение об ошибке
+    """
+    try:
+        # Определяем корень репозитория (где находится этот файл)
+        repo_root = Path(__file__).resolve().parent.parent
+        
+        # Выполняем git branch --show-current
+        process = await asyncio.create_subprocess_exec(
+            "git",
+            "branch",
+            "--show-current",
+            cwd=str(repo_root),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        
+        if process.returncode != 0:
+            error_msg = stderr.decode("utf-8", errors="ignore") if stderr else "Неизвестная ошибка"
+            # Проверяем, является ли это git репозиторием
+            if "not a git repository" in error_msg.lower():
+                return "Ошибка: текущая директория не является git репозиторием"
+            return f"Ошибка при выполнении git команды: {error_msg}"
+        
+        branch_name = stdout.decode("utf-8", errors="ignore").strip()
+        if not branch_name:
+            return "Не удалось определить текущую ветку (возможно, репозиторий в detached HEAD состоянии)"
+        
+        return branch_name
+        
+    except FileNotFoundError:
+        return "Ошибка: git не установлен или не найден в PATH"
+    except Exception as e:
+        return f"Ошибка при получении текущей ветки: {e}"
+
+
 # Add a dynamic greeting resource
 @mcp.resource("greeting://{name}")
 def get_greeting(name: str) -> str:
