@@ -501,18 +501,32 @@ async def site_down() -> str:
 
 
 @mcp.tool()
-async def git_branch() -> str:
+async def git_branch(repo_path: str | None = None) -> str:
     """Получить текущую ветку git-репозитория.
     
-    Выполняет команду 'git branch --show-current' в корне репозитория python-sdk
-    и возвращает название активной ветки.
+    Выполняет команду 'git branch --show-current' в указанном репозитории
+    или в текущей директории MCP сервера (python-sdk).
+    
+    Args:
+        repo_path: Путь к репозиторию (опционально). Если не указан, используется
+                   директория python-sdk. Можно указать абсолютный путь или путь
+                   относительно текущей директории.
     
     Returns:
         Название текущей ветки или сообщение об ошибке
     """
     try:
-        # Определяем корень репозитория (где находится этот файл)
-        repo_root = Path(__file__).resolve().parent.parent
+        # Определяем путь к репозиторию
+        if repo_path:
+            # Если указан путь, используем его
+            repo_root = Path(repo_path).resolve()
+            if not repo_root.exists():
+                return f"Ошибка: путь {repo_path} не существует"
+            if not repo_root.is_dir():
+                return f"Ошибка: {repo_path} не является директорией"
+        else:
+            # По умолчанию используем корень python-sdk (где находится этот файл)
+            repo_root = Path(__file__).resolve().parent.parent
         
         # Выполняем git branch --show-current
         process = await asyncio.create_subprocess_exec(
@@ -529,7 +543,7 @@ async def git_branch() -> str:
             error_msg = stderr.decode("utf-8", errors="ignore") if stderr else "Неизвестная ошибка"
             # Проверяем, является ли это git репозиторием
             if "not a git repository" in error_msg.lower():
-                return "Ошибка: текущая директория не является git репозиторием"
+                return f"Ошибка: {repo_root} не является git репозиторием"
             return f"Ошибка при выполнении git команды: {error_msg}"
         
         branch_name = stdout.decode("utf-8", errors="ignore").strip()
