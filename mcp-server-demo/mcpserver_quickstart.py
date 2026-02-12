@@ -5,16 +5,28 @@ Run from the repository root:
 """
 
 import asyncio
+import json
 import os
+import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 
 import httpx
 from dotenv import load_dotenv
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from mcp.server.mcpserver import MCPServer
 
 # Load environment variables from .env file
-load_dotenv()
+# Ищем .env в директории скрипта и в родительской директории (корень проекта)
+env_path = Path(__file__).parent.parent / ".env"
+if env_path.exists():
+    load_dotenv(env_path)
+else:
+    # Пробуем загрузить из текущей директории
+    load_dotenv()
 
 # Create an MCP server
 mcp = MCPServer("Demo")
@@ -697,6 +709,723 @@ async def get_pr_info(owner: str, repo: str, pr_number: int, github_token: str) 
         return f"Ошибка GitHub API: {e.response.status_code} - {e.response.text}"
     except Exception as e:
         return f"Ошибка при получении информации о PR: {e}"
+
+
+# ==================== Google Sheets Helper Functions ====================
+
+def _get_sheets_service():
+    """Создание клиента Google Sheets API с service account."""
+    credentials_path = os.getenv("GOOGLE_SHEETS_CREDENTIALS_PATH", "").strip()
+    if not credentials_path:
+        raise ValueError("GOOGLE_SHEETS_CREDENTIALS_PATH не задан в переменных окружения")
+    
+    creds_path = Path(credentials_path)
+    if not creds_path.exists():
+        raise ValueError(f"Файл credentials не найден: {credentials_path}")
+    
+    SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+    creds = service_account.Credentials.from_service_account_file(
+        str(creds_path), scopes=SCOPES
+    )
+    service = build('sheets', 'v4', credentials=creds)
+    return service
+
+
+def _get_sheet_gid(spreadsheet_id: str, sheet_name: str) -> int | None:
+    """Получение GID листа для формирования deep-link."""
+    try:
+        service = _get_sheets_service()
+        spreadsheet = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        sheets = spreadsheet.get('sheets', [])
+        for sheet in sheets:
+            if sheet['properties']['title'] == sheet_name:
+                return sheet['properties']['sheetId']
+        return None
+    except Exception as e:
+        return None
+
+
+def _validate_date(date_str: str) -> bool:
+    """Валидация формата даты DD-MM-YYYY."""
+    if not date_str or not isinstance(date_str, str):
+        return False
+    pattern = r'^\d{2}-\d{2}-\d{4}$'
+    if not re.match(pattern, date_str):
+        return False
+    try:
+        day, month, year = date_str.split('-')
+        datetime(int(year), int(month), int(day))
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def _validate_time(time_str: str) -> bool:
+    """Валидация формата времени HH:MM."""
+    if not time_str or not isinstance(time_str, str):
+        return False
+    pattern = r'^\d{2}:\d{2}$'
+    if not re.match(pattern, time_str):
+        return False
+    try:
+        hour, minute = time_str.split(':')
+        hour_int = int(hour)
+        minute_int = int(minute)
+        if hour_int < 0 or hour_int > 23 or minute_int < 0 or minute_int > 59:
+            return False
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def _find_max_reg_id(service, spreadsheet_id: str, sheet_name: str) -> int:
+    """Поиск максимального ID_записи на листе 'Записи'."""
+    try:
+        # Читаем колонку A (ID_записи), начиная со строки 2 (пропускаем заголовок)
+        range_name = f"{sheet_name}!A2:A"
+        result = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=range_name
+        ).execute()
+        values = result.get('values', [])
+        
+        max_id = 0
+        for row in values:
+            if row and row[0]:
+                try:
+                    reg_id = int(row[0])
+                    if reg_id > max_id:
+                        max_id = reg_id
+                except (ValueError, TypeError):
+                    continue
+        return max_id
+    except Exception:
+        return 0
+
+
+def _get_user_fio(service, spreadsheet_id: str, sheet_name: str, username: str) -> str | None:
+    """Получение ФИО пользователя по username."""
+    try:
+        # Читаем весь лист
+        range_name = f"{sheet_name}!A2:F"  # A=Username, B=ФИО (индекс 1)
+        result = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=range_name
+        ).execute()
+        values = result.get('values', [])
+        
+        for row in values:
+            if row and len(row) > 0:
+                try:
+                    row_username = row[0] if len(row) > 0 else ""  # Колонка A - Username
+                    if row_username == username and len(row) > 1:
+                        return row[1] if row[1] else None  # Колонка B - ФИО
+                except (ValueError, TypeError):
+                    continue
+        return None
+    except Exception:
+        return None
+
+
+# ==================== Google Sheets MCP Tools ====================
+
+@mcp.tool()
+async def user_get(username: str) -> str:
+    """Получить данные пользователя по username.
+    
+    Args:
+        username: Username пользователя из Telegram
+        
+    Returns:
+        JSON строка с данными пользователя или сообщение об ошибке
+    """
+    try:
+        spreadsheet_id = os.getenv("SHEETS_SPREADSHEET_ID", "").strip()
+        sheet_name = os.getenv("SHEETS_USERS_SHEET", "Пользователи").strip()
+        
+        if not spreadsheet_id:
+            return "Ошибка: SHEETS_SPREADSHEET_ID не задан в переменных окружения"
+        
+        service = _get_sheets_service()
+        range_name = f"{sheet_name}!A2:F"  # A=Username, B=ФИО, C=Телефон, D=Статус, E=Дата_регистрации, F=Примечание
+        result = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=range_name
+        ).execute()
+        values = result.get('values', [])
+        
+        for row in values:
+            if row and len(row) > 0:
+                try:
+                    row_username = row[0] if len(row) > 0 else ""
+                    if row_username == username:
+                        user_data = {
+                            "username": row_username,
+                            "fio": row[1] if len(row) > 1 else "",
+                            "phone": row[2] if len(row) > 2 else "",
+                            "status": row[3] if len(row) > 3 else "",
+                            "date_reg": row[4] if len(row) > 4 else "",
+                            "note": row[5] if len(row) > 5 else ""
+                        }
+                        return json.dumps(user_data, ensure_ascii=False)
+                except (ValueError, TypeError):
+                    continue
+        
+        return "Ошибка: Пользователь не найден"
+    except Exception as e:
+        return f"Ошибка при получении данных пользователя: {e}"
+
+
+@mcp.tool()
+async def user_register(username: str, fio: str, phone: str) -> str:
+    """Зарегистрировать или обновить данные пользователя.
+    
+    Args:
+        username: Username из Telegram
+        fio: ФИО пользователя
+        phone: Телефон пользователя
+        
+    Returns:
+        JSON строка со статусом операции
+    """
+    try:
+        spreadsheet_id = os.getenv("SHEETS_SPREADSHEET_ID", "").strip()
+        sheet_name = os.getenv("SHEETS_USERS_SHEET", "Пользователи").strip()
+        
+        if not spreadsheet_id:
+            return "Ошибка: SHEETS_SPREADSHEET_ID не задан в переменных окружения"
+        
+        service = _get_sheets_service()
+        range_name = f"{sheet_name}!A2:F"  # A=Username, B=ФИО, C=Телефон, D=Статус, E=Дата_регистрации, F=Примечание
+        result = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=range_name
+        ).execute()
+        values = result.get('values', [])
+        
+        # Ищем пользователя
+        row_index = None
+        for i, row in enumerate(values):
+            if row and len(row) > 0:
+                try:
+                    row_username = row[0] if len(row) > 0 else ""
+                    if row_username == username:
+                        row_index = i + 2  # +2 потому что начинаем с строки 2 и индексация с 0
+                        break
+                except (ValueError, TypeError):
+                    continue
+        
+        today = datetime.now().strftime("%d-%m-%Y")
+        new_row = [username, fio, phone, "active", today, ""]
+        
+        if row_index is None:
+            # Добавляем новую строку
+            body = {'values': [new_row]}
+            service.spreadsheets().values().append(
+                spreadsheetId=spreadsheet_id,
+                range=f"{sheet_name}!A:F",
+                valueInputOption='RAW',
+                body=body
+            ).execute()
+            return json.dumps({"status": "registered"}, ensure_ascii=False)
+        else:
+            # Обновляем существующую строку
+            body = {'values': [new_row]}
+            service.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=f"{sheet_name}!A{row_index}:F{row_index}",
+                valueInputOption='RAW',
+                body=body
+            ).execute()
+            return json.dumps({"status": "updated"}, ensure_ascii=False)
+    except Exception as e:
+        return f"Ошибка при регистрации пользователя: {e}"
+
+
+@mcp.tool()
+async def user_block(username: str) -> str:
+    """Заблокировать пользователя.
+    
+    Args:
+        username: Username пользователя из Telegram
+        
+    Returns:
+        Статус операции
+    """
+    try:
+        spreadsheet_id = os.getenv("SHEETS_SPREADSHEET_ID", "").strip()
+        sheet_name = os.getenv("SHEETS_USERS_SHEET", "Пользователи").strip()
+        
+        if not spreadsheet_id:
+            return "Ошибка: SHEETS_SPREADSHEET_ID не задан в переменных окружения"
+        
+        service = _get_sheets_service()
+        range_name = f"{sheet_name}!A2:F"  # A=Username, B=ФИО, C=Телефон, D=Статус, E=Дата_регистрации, F=Примечание
+        result = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=range_name
+        ).execute()
+        values = result.get('values', [])
+        
+        for i, row in enumerate(values):
+            if row and len(row) > 0:
+                try:
+                    row_username = row[0] if len(row) > 0 else ""
+                    if row_username == username:
+                        row_index = i + 2
+                        body = {'values': [["blocked"]]}
+                        service.spreadsheets().values().update(
+                            spreadsheetId=spreadsheet_id,
+                            range=f"{sheet_name}!D{row_index}",  # Колонка D - Статус
+                            valueInputOption='RAW',
+                            body=body
+                        ).execute()
+                        return "Пользователь заблокирован"
+                except (ValueError, TypeError):
+                    continue
+        
+        return "Ошибка: Пользователь не найден"
+    except Exception as e:
+        return f"Ошибка при блокировке пользователя: {e}"
+
+
+@mcp.tool()
+async def user_unblock(username: str) -> str:
+    """Разблокировать пользователя.
+    
+    Args:
+        username: Username пользователя из Telegram
+        
+    Returns:
+        Статус операции
+    """
+    try:
+        spreadsheet_id = os.getenv("SHEETS_SPREADSHEET_ID", "").strip()
+        sheet_name = os.getenv("SHEETS_USERS_SHEET", "Пользователи").strip()
+        
+        if not spreadsheet_id:
+            return "Ошибка: SHEETS_SPREADSHEET_ID не задан в переменных окружения"
+        
+        service = _get_sheets_service()
+        range_name = f"{sheet_name}!A2:F"  # A=Username, B=ФИО, C=Телефон, D=Статус, E=Дата_регистрации, F=Примечание
+        result = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=range_name
+        ).execute()
+        values = result.get('values', [])
+        
+        for i, row in enumerate(values):
+            if row and len(row) > 0:
+                try:
+                    row_username = row[0] if len(row) > 0 else ""
+                    if row_username == username:
+                        row_index = i + 2
+                        body = {'values': [["active"]]}
+                        service.spreadsheets().values().update(
+                            spreadsheetId=spreadsheet_id,
+                            range=f"{sheet_name}!D{row_index}",  # Колонка D - Статус
+                            valueInputOption='RAW',
+                            body=body
+                        ).execute()
+                        return "Пользователь разблокирован"
+                except (ValueError, TypeError):
+                    continue
+        
+        return "Ошибка: Пользователь не найден"
+    except Exception as e:
+        return f"Ошибка при разблокировке пользователя: {e}"
+
+
+@mcp.tool()
+async def user_delete(username: str) -> str:
+    """Удалить регистрацию пользователя из Google Sheets.
+    
+    Args:
+        username: Username пользователя из Telegram
+        
+    Returns:
+        Статус операции
+    """
+    try:
+        spreadsheet_id = os.getenv("SHEETS_SPREADSHEET_ID", "").strip()
+        sheet_name = os.getenv("SHEETS_USERS_SHEET", "Пользователи").strip()
+        
+        if not spreadsheet_id:
+            return "Ошибка: SHEETS_SPREADSHEET_ID не задан в переменных окружения"
+        
+        service = _get_sheets_service()
+        range_name = f"{sheet_name}!A2:F"  # A=Username, B=ФИО, C=Телефон, D=Статус, E=Дата_регистрации, F=Примечание
+        result = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=range_name
+        ).execute()
+        values = result.get('values', [])
+        
+        # Получаем sheet_id для удаления строки
+        sheet_gid = _get_sheet_gid(spreadsheet_id, sheet_name)
+        
+        for i, row in enumerate(values):
+            if row and len(row) > 0:
+                try:
+                    row_username = row[0] if len(row) > 0 else ""
+                    if row_username == username:
+                        row_index = i + 2  # +2 потому что начинаем с строки 2 и индексация с 0
+                        
+                        # Удаляем строку через batchUpdate
+                        requests = [{
+                            'deleteDimension': {
+                                'range': {
+                                    'sheetId': sheet_gid,
+                                    'dimension': 'ROWS',
+                                    'startIndex': row_index - 1,  # Индексация с 0
+                                    'endIndex': row_index
+                                }
+                            }
+                        }]
+                        
+                        body = {'requests': requests}
+                        service.spreadsheets().batchUpdate(
+                            spreadsheetId=spreadsheet_id,
+                            body=body
+                        ).execute()
+                        
+                        return json.dumps({"status": "deleted", "username": username}, ensure_ascii=False)
+                except (ValueError, TypeError):
+                    continue
+        
+        return "Ошибка: Пользователь не найден"
+    except Exception as e:
+        return f"Ошибка при удалении пользователя: {e}"
+
+
+@mcp.tool()
+async def reg_create(username: str, date: str, time: str, note: str = "") -> str:
+    """Создать запись на тренировку.
+    
+    Args:
+        username: Username пользователя из Telegram
+        date: Дата в формате DD-MM-YYYY
+        time: Время в формате HH:MM
+        note: Примечание к записи (опционально)
+        
+    Returns:
+        JSON строка с данными созданной записи
+    """
+    try:
+        spreadsheet_id = os.getenv("SHEETS_SPREADSHEET_ID", "").strip()
+        users_sheet = os.getenv("SHEETS_USERS_SHEET", "Пользователи").strip()
+        regs_sheet = os.getenv("SHEETS_REGS_SHEET", "Записи").strip()
+        
+        if not spreadsheet_id:
+            return "Ошибка: SHEETS_SPREADSHEET_ID не задан в переменных окружения"
+        
+        # Валидация
+        if not _validate_date(date):
+            return "Ошибка: Неверный формат даты. Используйте DD-MM-YYYY"
+        if not _validate_time(time):
+            return "Ошибка: Неверный формат времени. Используйте HH:MM"
+        
+        service = _get_sheets_service()
+        
+        # Проверка пользователя
+        user_data_str = await user_get(username)
+        if user_data_str.startswith("Ошибка"):
+            return "Ошибка: Пользователь не найден. Сначала зарегистрируйтесь"
+        
+        user_data = json.loads(user_data_str)
+        if user_data.get("status") == "blocked":
+            return "Ошибка: Пользователь заблокирован"
+        
+        fio = user_data.get("fio", "")
+        
+        # Проверка на дубликат активной записи
+        range_name = f"{regs_sheet}!A2:H"  # A=ID_записи, B=Username, C=ФИО, D=Дата, E=Время, F=Статус, G=Обновлено, H=Примечание
+        result = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=range_name
+        ).execute()
+        values = result.get('values', [])
+        
+        for row in values:
+            if row and len(row) > 5:
+                try:
+                    row_username = row[1] if len(row) > 1 else ""  # Колонка B - Username
+                    row_date = row[3] if len(row) > 3 else ""  # Колонка D - Дата
+                    row_time = row[4] if len(row) > 4 else ""  # Колонка E - Время
+                    row_status = row[5] if len(row) > 5 else ""  # Колонка F - Статус
+                    
+                    if (row_username == username and 
+                        row_date == date and 
+                        row_time == time and 
+                        row_status == "Активна"):
+                        return "Ошибка: У вас уже есть активная запись на это время"
+                except (ValueError, TypeError):
+                    continue
+        
+        # Генерация reg_id
+        max_id = _find_max_reg_id(service, spreadsheet_id, regs_sheet)
+        reg_id = max_id + 1
+        
+        # Добавление записи
+        now = datetime.now().strftime("%d-%m-%Y %H:%M")
+        new_row = [reg_id, username, fio, date, time, "Активна", now, note or ""]  # A=ID, B=Username, C=ФИО, D=Дата, E=Время, F=Статус, G=Обновлено, H=Примечание
+        body = {'values': [new_row]}
+        service.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range=f"{regs_sheet}!A:H",
+            valueInputOption='RAW',
+            body=body
+        ).execute()
+        
+        # Получение номера строки для формирования ссылки
+        result = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=f"{regs_sheet}!A2:A"
+        ).execute()
+        row_count = len(result.get('values', []))
+        row_number = row_count + 1  # +1 потому что заголовок
+        
+        # Формирование ссылок
+        sheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
+        sheet_gid = _get_sheet_gid(spreadsheet_id, regs_sheet)
+        if sheet_gid is not None:
+            row_url = f"{sheet_url}/edit#gid={sheet_gid}&range=A{row_number}"
+        else:
+            row_url = sheet_url
+        
+        result_data = {
+            "reg_id": reg_id,
+            "sheet_url": sheet_url,
+            "row_url": row_url,
+            "date": date,
+            "time": time,
+            "fio": fio
+        }
+        return json.dumps(result_data, ensure_ascii=False)
+    except Exception as e:
+        return f"Ошибка при создании записи: {e}"
+
+
+@mcp.tool()
+async def reg_find_by_user(username: str) -> str:
+    """Найти все активные записи пользователя.
+    
+    Args:
+        username: Username пользователя из Telegram
+        
+    Returns:
+        JSON массив записей
+    """
+    try:
+        spreadsheet_id = os.getenv("SHEETS_SPREADSHEET_ID", "").strip()
+        regs_sheet = os.getenv("SHEETS_REGS_SHEET", "Записи").strip()
+        
+        if not spreadsheet_id:
+            return "Ошибка: SHEETS_SPREADSHEET_ID не задан в переменных окружения"
+        
+        service = _get_sheets_service()
+        range_name = f"{regs_sheet}!A2:H"  # A=ID_записи, B=Username, C=ФИО, D=Дата, E=Время, F=Статус, G=Обновлено, H=Примечание
+        result = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=range_name
+        ).execute()
+        values = result.get('values', [])
+        
+        active_regs = []
+        for row in values:
+            if row and len(row) > 5:
+                try:
+                    row_username = row[1] if len(row) > 1 else ""  # Колонка B - Username
+                    row_status = row[5] if len(row) > 5 else ""  # Колонка F - Статус
+                    
+                    if row_username == username and row_status == "Активна":
+                        reg_data = {
+                            "reg_id": int(row[0]) if row[0] else 0,
+                            "date": row[3] if len(row) > 3 else "",
+                            "time": row[4] if len(row) > 4 else "",
+                            "status": row_status,
+                            "updated": row[6] if len(row) > 6 else "",
+                            "fio": row[2] if len(row) > 2 else ""
+                        }
+                        active_regs.append(reg_data)
+                except (ValueError, TypeError):
+                    continue
+        
+        return json.dumps(active_regs, ensure_ascii=False)
+    except Exception as e:
+        return f"Ошибка при поиске записей: {e}"
+
+
+@mcp.tool()
+async def reg_reschedule(reg_id: int, new_date: str, new_time: str) -> str:
+    """Перенести запись на другое время.
+    
+    Args:
+        reg_id: ID записи
+        new_date: Новая дата в формате DD-MM-YYYY
+        new_time: Новое время в формате HH:MM
+        
+    Returns:
+        JSON строка с обновленными данными записи
+    """
+    try:
+        spreadsheet_id = os.getenv("SHEETS_SPREADSHEET_ID", "").strip()
+        regs_sheet = os.getenv("SHEETS_REGS_SHEET", "Записи").strip()
+        
+        if not spreadsheet_id:
+            return "Ошибка: SHEETS_SPREADSHEET_ID не задан в переменных окружения"
+        
+        # Валидация
+        if not _validate_date(new_date):
+            return "Ошибка: Неверный формат даты. Используйте DD-MM-YYYY"
+        if not _validate_time(new_time):
+            return "Ошибка: Неверный формат времени. Используйте HH:MM"
+        
+        service = _get_sheets_service()
+        range_name = f"{regs_sheet}!A2:H"  # A=ID_записи, B=Username, C=ФИО, D=Дата, E=Время, F=Статус, G=Обновлено, H=Примечание
+        result = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=range_name
+        ).execute()
+        values = result.get('values', [])
+        
+        row_index = None
+        current_username = None
+        
+        for i, row in enumerate(values):
+            if row and len(row) > 0:
+                try:
+                    row_reg_id = int(row[0])
+                    if row_reg_id == reg_id:
+                        row_index = i + 2
+                        current_username = row[1] if len(row) > 1 else None
+                        break
+                except (ValueError, TypeError):
+                    continue
+        
+        if row_index is None:
+            return "Ошибка: Запись не найдена"
+        
+        # Проверка на конфликт с другой активной записью
+        for row in values:
+            if row and len(row) > 5:
+                try:
+                    row_reg_id = int(row[0])
+                    row_username = row[1] if len(row) > 1 else ""
+                    row_date = row[3] if len(row) > 3 else ""
+                    row_time = row[4] if len(row) > 4 else ""
+                    row_status = row[5] if len(row) > 5 else ""
+                    
+                    if (row_reg_id != reg_id and
+                        row_username == current_username and
+                        row_date == new_date and
+                        row_time == new_time and
+                        row_status == "Активна"):
+                        return "Ошибка: У вас уже есть активная запись на это время"
+                except (ValueError, TypeError):
+                    continue
+        
+        # Обновление записи
+        now = datetime.now().strftime("%d-%m-%Y %H:%M")
+        # Обновляем Дата и Время
+        body = {'values': [[new_date, new_time]]}
+        service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{regs_sheet}!D{row_index}:E{row_index}",
+            valueInputOption='RAW',
+            body=body
+        ).execute()
+        # Обновляем Обновлено
+        body = {'values': [[now]]}
+        service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id,
+            range=f"{regs_sheet}!G{row_index}",  # Колонка G - Обновлено
+            valueInputOption='RAW',
+            body=body
+        ).execute()
+        
+        # Формирование ссылки
+        sheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
+        sheet_gid = _get_sheet_gid(spreadsheet_id, regs_sheet)
+        if sheet_gid is not None:
+            row_url = f"{sheet_url}/edit#gid={sheet_gid}&range=A{row_index}"
+        else:
+            row_url = sheet_url
+        
+        result_data = {
+            "reg_id": reg_id,
+            "date": new_date,
+            "time": new_time,
+            "status": "Активна",
+            "updated": now,
+            "row_url": row_url
+        }
+        return json.dumps(result_data, ensure_ascii=False)
+    except Exception as e:
+        return f"Ошибка при переносе записи: {e}"
+
+
+@mcp.tool()
+async def reg_cancel(reg_id: int) -> str:
+    """Отменить и удалить запись из Google Sheets.
+    
+    Args:
+        reg_id: ID записи
+        
+    Returns:
+        Статус операции
+    """
+    try:
+        spreadsheet_id = os.getenv("SHEETS_SPREADSHEET_ID", "").strip()
+        regs_sheet = os.getenv("SHEETS_REGS_SHEET", "Записи").strip()
+        
+        if not spreadsheet_id:
+            return "Ошибка: SHEETS_SPREADSHEET_ID не задан в переменных окружения"
+        
+        service = _get_sheets_service()
+        range_name = f"{regs_sheet}!A2:H"  # A=ID_записи, B=Username, C=ФИО, D=Дата, E=Время, F=Статус, G=Обновлено, H=Примечание
+        result = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=range_name
+        ).execute()
+        values = result.get('values', [])
+        
+        # Получаем sheet_id для удаления строки
+        sheet_metadata = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        sheet_gid = _get_sheet_gid(spreadsheet_id, regs_sheet)
+        
+        for i, row in enumerate(values):
+            if row and len(row) > 0:
+                try:
+                    row_reg_id = int(row[0])
+                    if row_reg_id == reg_id:
+                        row_index = i + 2  # +2 потому что начинаем с строки 2 и индексация с 0
+                        
+                        # Удаляем строку через batchUpdate
+                        requests = [{
+                            'deleteDimension': {
+                                'range': {
+                                    'sheetId': sheet_gid,
+                                    'dimension': 'ROWS',
+                                    'startIndex': row_index - 1,  # Индексация с 0
+                                    'endIndex': row_index
+                                }
+                            }
+                        }]
+                        
+                        body = {'requests': requests}
+                        service.spreadsheets().batchUpdate(
+                            spreadsheetId=spreadsheet_id,
+                            body=body
+                        ).execute()
+                        
+                        return json.dumps({"status": "deleted", "reg_id": reg_id}, ensure_ascii=False)
+                except (ValueError, TypeError):
+                    continue
+        
+        return "Ошибка: Запись не найдена"
+    except Exception as e:
+        return f"Ошибка при отмене записи: {e}"
 
 
 # Add a dynamic greeting resource
