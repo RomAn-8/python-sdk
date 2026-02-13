@@ -745,6 +745,38 @@ def _get_sheet_gid(spreadsheet_id: str, sheet_name: str) -> int | None:
         return None
 
 
+def _get_or_create_sheet_name(spreadsheet_id: str, preferred_name: str) -> str:
+    """Получить название листа, если он существует, иначе вернуть первый лист или создать новый."""
+    try:
+        service = _get_sheets_service()
+        spreadsheet = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        sheets = spreadsheet.get('sheets', [])
+        
+        # Проверяем, существует ли лист с предпочитаемым названием
+        for sheet in sheets:
+            if sheet['properties']['title'] == preferred_name:
+                return preferred_name
+        
+        # Если лист не найден, используем первый доступный лист
+        if sheets:
+            return sheets[0]['properties']['title']
+        
+        # Если листов нет, создаем новый
+        requests = [{
+            'addSheet': {
+                'properties': {
+                    'title': preferred_name
+                }
+            }
+        }]
+        body = {'requests': requests}
+        service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body=body).execute()
+        return preferred_name
+    except Exception as e:
+        # В случае ошибки возвращаем предпочитаемое название
+        return preferred_name
+
+
 def _validate_date(date_str: str) -> bool:
     """Валидация формата даты DD-MM-YYYY."""
     if not date_str or not isinstance(date_str, str):
@@ -825,6 +857,13 @@ def _get_user_fio(service, spreadsheet_id: str, sheet_name: str, username: str) 
         return None
     except Exception:
         return None
+
+
+def _validate_priority(priority: str) -> bool:
+    """Валидация приоритета задачи (high/middle/low)."""
+    if not priority or not isinstance(priority, str):
+        return False
+    return priority.lower() in ["high", "middle", "low"]
 
 
 # ==================== Google Sheets MCP Tools ====================
@@ -1426,6 +1465,363 @@ async def reg_cancel(reg_id: int) -> str:
         return "Ошибка: Запись не найдена"
     except Exception as e:
         return f"Ошибка при отмене записи: {e}"
+
+
+# ==================== Task Management MCP Tools ====================
+
+@mcp.tool()
+async def task_create(date: str, time: str, task: str, priority: str) -> str:
+    """Создать задачу в Google Sheets.
+    
+    Args:
+        date: Дата в формате DD-MM-YYYY
+        time: Время в формате HH:MM
+        task: Описание задачи
+        priority: Приоритет задачи (high/middle/low)
+        
+    Returns:
+        JSON строка с данными созданной задачи и ссылкой на строку
+    """
+    try:
+        spreadsheet_id = os.getenv("SHEETS_SPREADSHEET_ID_2", "").strip()
+        if not spreadsheet_id:
+            # Fallback на основной spreadsheet_id, если второй не задан
+            spreadsheet_id = os.getenv("SHEETS_SPREADSHEET_ID", "").strip()
+        preferred_sheet_name = os.getenv("SHEETS_TASKS_SHEET", "Список задач").strip()
+        
+        if not spreadsheet_id:
+            return "Ошибка: SHEETS_SPREADSHEET_ID_2 не задан в переменных окружения"
+        
+        # Валидация
+        if not _validate_date(date):
+            return "Ошибка: Неверный формат даты. Используйте DD-MM-YYYY"
+        if not _validate_time(time):
+            return "Ошибка: Неверный формат времени. Используйте HH:MM"
+        if not _validate_priority(priority):
+            return "Ошибка: Неверный приоритет. Используйте high, middle или low"
+        
+        service = _get_sheets_service()
+        
+        # Получаем или создаем лист
+        tasks_sheet = _get_or_create_sheet_name(spreadsheet_id, preferred_sheet_name)
+        
+        # Добавление задачи
+        # A=Статус (FALSE), B=Дата, C=Время, D=Задача, E=Приоритет
+        # Используем USER_ENTERED для правильной интерпретации boolean как checkbox
+        new_row = [False, date, time, task, priority.lower()]
+        body = {'values': [new_row]}
+        append_result = service.spreadsheets().values().append(
+            spreadsheetId=spreadsheet_id,
+            range=f"{tasks_sheet}!A:E",
+            valueInputOption='USER_ENTERED',
+            body=body
+        ).execute()
+        
+        # Получаем номер добавленной строки из ответа
+        updated_range = append_result.get('updates', {}).get('updatedRange', '')
+        if updated_range:
+            # Извлекаем номер строки из диапазона (например, "Список задач!A5:E5" -> 5)
+            match = re.search(r'!A(\d+):', updated_range)
+            if match:
+                row_number = int(match.group(1))
+            else:
+                # Fallback: получаем номер строки через подсчет
+                result = service.spreadsheets().values().get(
+                    spreadsheetId=spreadsheet_id,
+                    range=f"{tasks_sheet}!A2:A"
+                ).execute()
+                row_count = len(result.get('values', []))
+                row_number = row_count + 1  # +1 потому что заголовок
+        else:
+            # Fallback: получаем номер строки через подсчет
+            result = service.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=f"{tasks_sheet}!A2:A"
+            ).execute()
+            row_count = len(result.get('values', []))
+            row_number = row_count + 1  # +1 потому что заголовок
+        
+        # Устанавливаем формат checkbox для колонки A в новой строке
+        sheet_gid = _get_sheet_gid(spreadsheet_id, tasks_sheet)
+        if sheet_gid is not None:
+            try:
+                # Устанавливаем формат checkbox для ячейки A в новой строке
+                requests = [{
+                    'repeatCell': {
+                        'range': {
+                            'sheetId': sheet_gid,
+                            'startRowIndex': row_number - 1,  # Индексация с 0
+                            'endRowIndex': row_number,
+                            'startColumnIndex': 0,  # Колонка A
+                            'endColumnIndex': 1
+                        },
+                        'cell': {
+                            'dataValidation': {
+                                'condition': {
+                                    'type': 'BOOLEAN'
+                                },
+                                'showCustomUi': True,
+                                'strict': True
+                            }
+                        },
+                        'fields': 'dataValidation'
+                    }
+                }]
+                
+                body_update = {'requests': requests}
+                service.spreadsheets().batchUpdate(
+                    spreadsheetId=spreadsheet_id,
+                    body=body_update
+                ).execute()
+            except Exception as e:
+                # Если не удалось установить формат checkbox, продолжаем работу
+                pass  # Игнорируем ошибку форматирования
+        
+        # Формирование ссылок
+        sheet_url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
+        sheet_gid = _get_sheet_gid(spreadsheet_id, tasks_sheet)
+        if sheet_gid is not None:
+            row_url = f"{sheet_url}/edit#gid={sheet_gid}&range=A{row_number}"
+        else:
+            row_url = sheet_url
+        
+        result_data = {
+            "row_number": row_number,
+            "completed": False,
+            "date": date,
+            "time": time,
+            "task": task,
+            "priority": priority.lower(),
+            "row_url": row_url
+        }
+        return json.dumps(result_data, ensure_ascii=False)
+    except Exception as e:
+        return f"Ошибка при создании задачи: {e}"
+
+
+@mcp.tool()
+async def task_list(priority: str | None = None, completed: bool | None = None, date_from: str | None = None, date_to: str | None = None) -> str:
+    """Получить список задач с фильтрацией.
+    
+    Args:
+        priority: Фильтр по приоритету (high/middle/low, опционально)
+        completed: Фильтр по статусу выполнения (true/false, опционально)
+        date_from: Начальная дата для фильтрации (DD-MM-YYYY, опционально)
+        date_to: Конечная дата для фильтрации (DD-MM-YYYY, опционально)
+        
+    Returns:
+        JSON строка с массивом задач
+    """
+    try:
+        spreadsheet_id = os.getenv("SHEETS_SPREADSHEET_ID_2", "").strip()
+        if not spreadsheet_id:
+            # Fallback на основной spreadsheet_id, если второй не задан
+            spreadsheet_id = os.getenv("SHEETS_SPREADSHEET_ID", "").strip()
+        preferred_sheet_name = os.getenv("SHEETS_TASKS_SHEET", "Список задач").strip()
+        
+        if not spreadsheet_id:
+            return "Ошибка: SHEETS_SPREADSHEET_ID_2 не задан в переменных окружения"
+        
+        # Валидация фильтров
+        if priority and not _validate_priority(priority):
+            return "Ошибка: Неверный приоритет. Используйте high, middle или low"
+        if date_from and not _validate_date(date_from):
+            return "Ошибка: Неверный формат date_from. Используйте DD-MM-YYYY"
+        if date_to and not _validate_date(date_to):
+            return "Ошибка: Неверный формат date_to. Используйте DD-MM-YYYY"
+        
+        service = _get_sheets_service()
+        
+        # Получаем или создаем лист
+        tasks_sheet = _get_or_create_sheet_name(spreadsheet_id, preferred_sheet_name)
+        range_name = f"{tasks_sheet}!A2:E"  # A=Статус, B=Дата, C=Время, D=Задача, E=Приоритет
+        result = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=range_name
+        ).execute()
+        values = result.get('values', [])
+        
+        tasks = []
+        for i, row in enumerate(values):
+            if not row or len(row) < 4:  # Минимум: статус, дата, время, задача
+                continue
+            
+            try:
+                # Парсинг строки
+                # A=Статус (TRUE/FALSE или текст), B=Дата, C=Время, D=Задача, E=Приоритет
+                row_completed = False
+                if len(row) > 0:
+                    completed_val = row[0]
+                    if isinstance(completed_val, bool):
+                        row_completed = completed_val
+                    elif isinstance(completed_val, str):
+                        row_completed = completed_val.lower() in ["true", "1", "да", "выполнено"]
+                
+                row_date = row[1] if len(row) > 1 else ""
+                row_time = row[2] if len(row) > 2 else ""
+                row_task = row[3] if len(row) > 3 else ""
+                row_priority = row[4].lower() if len(row) > 4 and row[4] else ""
+                
+                # Фильтрация
+                if priority and row_priority != priority.lower():
+                    continue
+                if completed is not None and row_completed != completed:
+                    continue
+                if date_from:
+                    try:
+                        from_day, from_month, from_year = date_from.split('-')
+                        row_day, row_month, row_year = row_date.split('-')
+                        from_date = datetime(int(from_year), int(from_month), int(from_day))
+                        row_date_obj = datetime(int(row_year), int(row_month), int(row_day))
+                        if row_date_obj < from_date:
+                            continue
+                    except (ValueError, TypeError):
+                        continue
+                if date_to:
+                    try:
+                        to_day, to_month, to_year = date_to.split('-')
+                        row_day, row_month, row_year = row_date.split('-')
+                        to_date = datetime(int(to_year), int(to_month), int(to_day))
+                        row_date_obj = datetime(int(row_year), int(row_month), int(row_day))
+                        if row_date_obj > to_date:
+                            continue
+                    except (ValueError, TypeError):
+                        continue
+                
+                row_number = i + 2  # +2 потому что начинаем с строки 2 и индексация с 0
+                tasks.append({
+                    "row_number": row_number,
+                    "completed": row_completed,
+                    "date": row_date,
+                    "time": row_time,
+                    "task": row_task,
+                    "priority": row_priority
+                })
+            except (ValueError, TypeError) as e:
+                continue
+        
+        return json.dumps(tasks, ensure_ascii=False)
+    except Exception as e:
+        return f"Ошибка при получении списка задач: {e}"
+
+
+@mcp.tool()
+async def task_delete(row_number: int) -> str:
+    """Удалить задачу из Google Sheets.
+    
+    Args:
+        row_number: Номер строки в Google Sheets (начиная с 2, так как строка 1 - заголовок)
+        
+    Returns:
+        JSON строка со статусом операции
+    """
+    try:
+        spreadsheet_id = os.getenv("SHEETS_SPREADSHEET_ID_2", "").strip()
+        if not spreadsheet_id:
+            # Fallback на основной spreadsheet_id, если второй не задан
+            spreadsheet_id = os.getenv("SHEETS_SPREADSHEET_ID", "").strip()
+        preferred_sheet_name = os.getenv("SHEETS_TASKS_SHEET", "Список задач").strip()
+        
+        if not spreadsheet_id:
+            return "Ошибка: SHEETS_SPREADSHEET_ID_2 не задан в переменных окружения"
+        
+        if row_number < 2:
+            return "Ошибка: Номер строки должен быть >= 2 (строка 1 - заголовок)"
+        
+        service = _get_sheets_service()
+        
+        # Получаем или создаем лист
+        tasks_sheet = _get_or_create_sheet_name(spreadsheet_id, preferred_sheet_name)
+        
+        # Проверка существования строки
+        range_name = f"{tasks_sheet}!A{row_number}:E{row_number}"
+        result = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=range_name
+        ).execute()
+        values = result.get('values', [])
+        
+        if not values or not values[0]:
+            return "Ошибка: Задача не найдена"
+        
+        # Проверяем, сколько всего строк данных (не считая заголовок)
+        all_data_range = f"{tasks_sheet}!A2:E"
+        all_data_result = service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range=all_data_range
+        ).execute()
+        all_rows = all_data_result.get('values', [])
+        # Подсчитываем только непустые строки с их номерами
+        non_empty_rows = [i + 2 for i, row in enumerate(all_rows) if row and any(cell for cell in row if cell and str(cell).strip())]
+        total_data_rows = len(non_empty_rows)
+        
+        # Если это последняя (единственная) строка данных, очищаем её вместо удаления
+        # (Google Sheets не позволяет удалить все строки данных, оставив только заголовок)
+        if total_data_rows <= 1 and row_number in non_empty_rows:
+            # Очищаем строку вместо удаления
+            clear_range = f"{tasks_sheet}!A{row_number}:E{row_number}"
+            service.spreadsheets().values().clear(
+                spreadsheetId=spreadsheet_id,
+                range=clear_range
+            ).execute()
+            result_data = {"status": "cleared", "row_number": row_number, "message": "Строка очищена (последняя строка данных)"}
+            return json.dumps(result_data, ensure_ascii=False)
+        
+        # Если строка не найдена в непустых строках, но существует - тоже очищаем
+        if row_number not in non_empty_rows and values and values[0]:
+            # Строка существует, но возможно пустая - очищаем
+            clear_range = f"{tasks_sheet}!A{row_number}:E{row_number}"
+            service.spreadsheets().values().clear(
+                spreadsheetId=spreadsheet_id,
+                range=clear_range
+            ).execute()
+            result_data = {"status": "cleared", "row_number": row_number, "message": "Строка очищена"}
+            return json.dumps(result_data, ensure_ascii=False)
+        
+        # Обычное удаление строки
+        # Получаем sheet_id для удаления строки
+        sheet_gid = _get_sheet_gid(spreadsheet_id, tasks_sheet)
+        if sheet_gid is None:
+            return "Ошибка: Не удалось найти лист"
+        
+        # Пытаемся удалить строку, при ошибке очищаем
+        try:
+            requests_list = [{
+                'deleteDimension': {
+                    'range': {
+                        'sheetId': sheet_gid,
+                        'dimension': 'ROWS',
+                        'startIndex': row_number - 1,  # Индексация с 0
+                        'endIndex': row_number
+                    }
+                }
+            }]
+            
+            body = {'requests': requests_list}
+            service.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body=body
+            ).execute()
+            
+            result_data = {"status": "deleted", "row_number": row_number}
+            return json.dumps(result_data, ensure_ascii=False)
+        except HttpError as delete_error:
+            # Если ошибка о невозможности удалить все строки - очищаем
+            error_str = str(delete_error)
+            if "delete all non-frozen rows" in error_str or "not possible to delete" in error_str:
+                clear_range = f"{tasks_sheet}!A{row_number}:E{row_number}"
+                service.spreadsheets().values().clear(
+                    spreadsheetId=spreadsheet_id,
+                    range=clear_range
+                ).execute()
+                result_data = {"status": "cleared", "row_number": row_number, "message": "Строка очищена (последняя строка данных)"}
+                return json.dumps(result_data, ensure_ascii=False)
+            # Иначе пробрасываем ошибку дальше
+            raise
+    except HttpError as e:
+        return f"Ошибка Google Sheets API: {e}"
+    except Exception as e:
+        return f"Ошибка при удалении задачи: {e}"
 
 
 # Add a dynamic greeting resource
