@@ -18,6 +18,8 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from mcp.server.mcpserver import MCPServer
+import paramiko
+from scp import SCPClient
 
 # Load environment variables from .env file
 # Ищем .env в директории скрипта и в родительской директории (корень проекта)
@@ -1822,6 +1824,847 @@ async def task_delete(row_number: int) -> str:
         return f"Ошибка Google Sheets API: {e}"
     except Exception as e:
         return f"Ошибка при удалении задачи: {e}"
+
+
+# ==================== DEPLOY TOOLS ====================
+
+def _create_ssh_client(host: str, port: int, username: str, password: str) -> paramiko.SSHClient:
+    """Создает и подключается к SSH клиенту."""
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    try:
+        client.connect(hostname=host, port=port, username=username, password=password, timeout=30)
+        return client
+    except Exception as e:
+        client.close()
+        raise Exception(f"Ошибка подключения к SSH: {e}")
+
+
+@mcp.tool()
+def deploy_check_docker(host: str, port: int, username: str, password: str) -> str:
+    """Проверяет наличие Docker на сервере и устанавливает его, если отсутствует.
+    
+    Args:
+        host: SSH host сервера
+        port: SSH port (обычно 22)
+        username: SSH username
+        password: SSH password
+    
+    Returns:
+        JSON строка с результатом проверки/установки Docker
+    """
+    ssh_client = None
+    try:
+        ssh_client = _create_ssh_client(host, port, username, password)
+        
+        # Проверяем наличие Docker
+        stdin, stdout, stderr = ssh_client.exec_command("which docker")
+        docker_path = stdout.read().decode().strip()
+        
+        if docker_path:
+            # Docker установлен, проверяем версию
+            stdin, stdout, stderr = ssh_client.exec_command("docker --version")
+            docker_version = stdout.read().decode().strip()
+            result = {
+                "status": "installed",
+                "message": f"Docker уже установлен: {docker_version}",
+                "docker_path": docker_path
+            }
+        else:
+            # Docker не установлен, устанавливаем
+            install_commands = [
+                "sudo apt-get update",
+                "sudo apt-get install -y ca-certificates curl gnupg lsb-release",
+                "sudo mkdir -p /etc/apt/keyrings",
+                "curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg",
+                'echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null',
+                "sudo apt-get update",
+                "sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin",
+                "sudo usermod -aG docker $USER"
+            ]
+            
+            for cmd in install_commands:
+                stdin, stdout, stderr = ssh_client.exec_command(cmd)
+                exit_status = stdout.channel.recv_exit_status()
+                if exit_status != 0:
+                    error_output = stderr.read().decode()
+                    result = {
+                        "status": "error",
+                        "message": f"Ошибка при установке Docker на шаге '{cmd}': {error_output}",
+                        "exit_status": exit_status
+                    }
+                    return json.dumps(result, ensure_ascii=False)
+            
+            result = {
+                "status": "installed",
+                "message": "Docker успешно установлен"
+            }
+        
+        return json.dumps(result, ensure_ascii=False)
+        
+    except Exception as e:
+        result = {
+            "status": "error",
+            "message": f"Ошибка при проверке/установке Docker: {str(e)}"
+        }
+        return json.dumps(result, ensure_ascii=False)
+    finally:
+        if ssh_client:
+            ssh_client.close()
+
+
+@mcp.tool()
+def deploy_upload_image(host: str, port: int, username: str, password: str, image_tar_path: str, remote_path: str) -> str:
+    """Загружает Docker image (.tar файл) на сервер через SCP.
+    
+    Args:
+        host: SSH host сервера
+        port: SSH port (обычно 22)
+        username: SSH username
+        password: SSH password
+        image_tar_path: Локальный путь к Docker image .tar файлу
+        remote_path: Путь на сервере для сохранения файла
+    
+    Returns:
+        JSON строка с результатом загрузки
+    """
+    ssh_client = None
+    try:
+        # Проверяем существование локального файла
+        local_path = Path(image_tar_path)
+        if not local_path.exists():
+            result = {
+                "status": "error",
+                "message": f"Локальный файл не найден: {image_tar_path}"
+            }
+            return json.dumps(result, ensure_ascii=False)
+        
+        ssh_client = _create_ssh_client(host, port, username, password)
+        
+        # Создаем директорию на сервере, если не существует
+        # Используем нормализацию пути для Linux (заменяем обратные слэши на прямые)
+        remote_dir = str(Path(remote_path).parent).replace('\\', '/')
+        remote_path = remote_path.replace('\\', '/')
+        
+        # Сначала проверяем, существует ли директория
+        check_cmd = f"test -d {remote_dir} && echo 'exists' || echo 'not_exists'"
+        stdin, stdout, stderr = ssh_client.exec_command(check_cmd)
+        check_output = stdout.read().decode().strip()
+        
+        if check_output != "exists":
+            # Пробуем создать директорию с sudo
+            mkdir_cmd = f"sudo mkdir -p {remote_dir}"
+            stdin, stdout, stderr = ssh_client.exec_command(mkdir_cmd)
+            exit_status = stdout.channel.recv_exit_status()
+            stdout_output = stdout.read().decode()
+            stderr_output = stderr.read().decode()
+            
+            if exit_status != 0:
+                # Если не получилось с sudo, пробуем без sudo (в домашней директории пользователя)
+                mkdir_cmd = f"mkdir -p {remote_dir}"
+                stdin, stdout, stderr = ssh_client.exec_command(mkdir_cmd)
+                exit_status = stdout.channel.recv_exit_status()
+                stdout_output = stdout.read().decode()
+                stderr_output = stderr.read().decode()
+            
+            # Проверяем еще раз, что директория создана
+            check_cmd = f"test -d {remote_dir} && echo 'exists' || echo 'not_exists'"
+            stdin, stdout, stderr = ssh_client.exec_command(check_cmd)
+            check_output = stdout.read().decode().strip()
+            
+            if check_output != "exists":
+                result = {
+                    "status": "error",
+                    "message": f"Не удалось создать директорию {remote_dir}. Exit status: {exit_status}, stdout: {stdout_output}, stderr: {stderr_output}"
+                }
+                return json.dumps(result, ensure_ascii=False)
+        
+        # Получаем имя текущего пользователя
+        whoami_cmd = "whoami"
+        stdin, stdout, stderr = ssh_client.exec_command(whoami_cmd)
+        current_user = stdout.read().decode().strip()
+        
+        # Изменяем владельца директории на текущего пользователя (чтобы SCP мог записать файл)
+        chown_cmd = f"sudo chown -R {current_user}:{current_user} {remote_dir} 2>&1"
+        stdin, stdout, stderr = ssh_client.exec_command(chown_cmd)
+        chown_exit = stdout.channel.recv_exit_status()
+        chown_output = stdout.read().decode()
+        chown_error = stderr.read().decode()
+        
+        # Проверяем, что владелец изменился
+        check_owner_cmd = f"stat -c '%U:%G' {remote_dir} 2>&1 || ls -ld {remote_dir} | awk '{{print $3\":\"$4}}'"
+        stdin, stdout, stderr = ssh_client.exec_command(check_owner_cmd)
+        owner_info = stdout.read().decode().strip()
+        
+        # Устанавливаем права на запись
+        chmod_cmd = f"sudo chmod -R 755 {remote_dir} 2>&1 || chmod -R 755 {remote_dir} 2>&1"
+        stdin, stdout, stderr = ssh_client.exec_command(chmod_cmd)
+        stdout.channel.recv_exit_status()
+        
+        # Проверяем права на запись в директорию
+        test_write_cmd = f"test -w {remote_dir} && echo 'writable' || echo 'not_writable'"
+        stdin, stdout, stderr = ssh_client.exec_command(test_write_cmd)
+        write_check = stdout.read().decode().strip()
+        
+        if write_check != "writable":
+            # Если все еще не можем писать, пробуем еще раз с более агрессивными правами
+            chmod_cmd = f"sudo chmod -R 777 {remote_dir} 2>&1"
+            stdin, stdout, stderr = ssh_client.exec_command(chmod_cmd)
+            stdout.channel.recv_exit_status()
+            
+            # Проверяем еще раз
+            test_write_cmd = f"test -w {remote_dir} && echo 'writable' || echo 'not_writable'"
+            stdin, stdout, stderr = ssh_client.exec_command(test_write_cmd)
+            write_check = stdout.read().decode().strip()
+            
+            if write_check != "writable":
+                result = {
+                    "status": "error",
+                    "message": f"Не удалось установить права на запись в директорию {remote_dir}. Владелец: {owner_info}, chown exit: {chown_exit}, chown output: {chown_output}, chown error: {chown_error}"
+                }
+                return json.dumps(result, ensure_ascii=False)
+        
+        # Загружаем файл через SCP
+        # Если директория принадлежит root, загружаем во временную директорию, затем перемещаем
+        # Нормализуем путь для Linux (на случай, если он еще не нормализован)
+        remote_path_normalized = remote_path.replace('\\', '/')
+        temp_remote_path = f"/tmp/{Path(remote_path_normalized).name}"
+        
+        try:
+            # Сначала пробуем загрузить напрямую
+            with SCPClient(ssh_client.get_transport()) as scp:
+                scp.put(str(local_path), remote_path)
+        except Exception as scp_error:
+            error_msg = str(scp_error)
+            # Если ошибка связана с правами или директорией, загружаем во временную директорию
+            if "No such file" in error_msg or "directory" in error_msg.lower() or "Permission denied" in error_msg:
+                try:
+                    # Загружаем во временную директорию
+                    with SCPClient(ssh_client.get_transport()) as scp:
+                        scp.put(str(local_path), temp_remote_path)
+                    
+                    # Проверяем, что файл загружен
+                    check_file_cmd = f"test -f {temp_remote_path} && echo 'exists' || echo 'not_exists'"
+                    stdin, stdout, stderr = ssh_client.exec_command(check_file_cmd)
+                    file_check = stdout.read().decode().strip()
+                    
+                    if file_check != "exists":
+                        result = {
+                            "status": "error",
+                            "message": f"Файл не был загружен во временную директорию {temp_remote_path}"
+                        }
+                        return json.dumps(result, ensure_ascii=False)
+                    
+                    # Убеждаемся, что целевая директория существует (используем нормализованный путь с кавычками)
+                    ensure_dir_cmd = f"sudo mkdir -p '{remote_dir}'"
+                    stdin, stdout, stderr = ssh_client.exec_command(ensure_dir_cmd)
+                    ensure_exit = stdout.channel.recv_exit_status()
+                    ensure_output = stdout.read().decode()
+                    ensure_error = stderr.read().decode()
+                    
+                    # Проверяем, что директория создана
+                    check_dir_cmd = f"test -d '{remote_dir}' && echo 'exists' || echo 'not_exists'"
+                    stdin, stdout, stderr = ssh_client.exec_command(check_dir_cmd)
+                    dir_check = stdout.read().decode().strip()
+                    
+                    if dir_check != "exists":
+                        # Пробуем создать еще раз и проверить
+                        ensure_dir_cmd2 = f"sudo mkdir -p '{remote_dir}' && sudo ls -la '{remote_dir}' 2>&1"
+                        stdin, stdout, stderr = ssh_client.exec_command(ensure_dir_cmd2)
+                        ls_output = stdout.read().decode()
+                        ls_error = stderr.read().decode()
+                        
+                        result = {
+                            "status": "error",
+                            "message": f"Не удалось создать директорию '{remote_dir}'. Exit: {ensure_exit}, output: {ensure_output}, error: {ensure_error}. Проверка: {ls_output or ls_error}"
+                        }
+                        return json.dumps(result, ensure_ascii=False)
+                    
+                    # Устанавливаем владельца директории
+                    chown_dir_cmd = f"sudo chown {current_user}:{current_user} '{remote_dir}'"
+                    stdin, stdout, stderr = ssh_client.exec_command(chown_dir_cmd)
+                    stdout.channel.recv_exit_status()
+                    
+                    # Используем sudo tee для записи файла (правильный способ с sudo)
+                    # tee правильно обрабатывает sudo и перенаправление
+                    # Используем нормализованный путь
+                    tee_cmd = f"sudo cat '{temp_remote_path}' | sudo tee '{remote_path_normalized}' > /dev/null"
+                    stdin, stdout, stderr = ssh_client.exec_command(tee_cmd)
+                    exit_status = stdout.channel.recv_exit_status()
+                    tee_output = stdout.read().decode()
+                    tee_error = stderr.read().decode()
+                    
+                    if exit_status != 0:
+                        # Пробуем другой способ - через dd с sudo и экранированными путями
+                        dd_cmd = f"sudo dd if='{temp_remote_path}' of='{remote_path_normalized}' bs=1M status=none 2>&1"
+                        stdin, stdout, stderr = ssh_client.exec_command(dd_cmd)
+                        exit_status = stdout.channel.recv_exit_status()
+                        dd_output = stdout.read().decode()
+                        dd_error = stderr.read().decode()
+                        
+                        if exit_status != 0:
+                            # Проверяем, что происходит с директорией и файлами
+                            ls_dir_cmd = f"ls -lad '{remote_dir}' 2>&1"
+                            stdin, stdout, stderr = ssh_client.exec_command(ls_dir_cmd)
+                            ls_dir_output = stdout.read().decode()
+                            
+                            test_file_cmd = f"test -f '{remote_path_normalized}' && echo 'exists' || echo 'not_exists'"
+                            stdin, stdout, stderr = ssh_client.exec_command(test_file_cmd)
+                            file_exists = stdout.read().decode().strip()
+                            
+                            # Проверяем путь к директории
+                            pwd_cmd = f"pwd && echo 'DIR_SEP' && ls -la /opt/ 2>&1 | head -5"
+                            stdin, stdout, stderr = ssh_client.exec_command(pwd_cmd)
+                            pwd_output = stdout.read().decode()
+                            
+                            result = {
+                                "status": "error",
+                                "message": f"Не удалось скопировать файл. tee ошибка: {tee_error or tee_output}. dd ошибка: {dd_error or dd_output}. Директория: {ls_dir_output}. Файл существует: {file_exists}. Пути: {pwd_output}"
+                            }
+                            return json.dumps(result, ensure_ascii=False)
+                    
+                    # Устанавливаем владельца и права файла
+                    chown_file_cmd = f"sudo chown {current_user}:{current_user} '{remote_path_normalized}' && sudo chmod 644 '{remote_path_normalized}'"
+                    stdin, stdout, stderr = ssh_client.exec_command(chown_file_cmd)
+                    chown_exit = stdout.channel.recv_exit_status()
+                    
+                    if chown_exit != 0:
+                        result = {
+                            "status": "error",
+                            "message": f"Файл скопирован, но не удалось установить владельца: {stderr.read().decode()}"
+                        }
+                        return json.dumps(result, ensure_ascii=False)
+                    
+                    # Удаляем временный файл
+                    rm_cmd = f"sudo rm -f {temp_remote_path}"
+                    stdin, stdout, stderr = ssh_client.exec_command(rm_cmd)
+                    stdout.channel.recv_exit_status()
+                except Exception as temp_error:
+                    result = {
+                        "status": "error",
+                        "message": f"Ошибка при загрузке файла: {error_msg}. Попытка загрузки во временную директорию также не удалась: {str(temp_error)}"
+                    }
+                    return json.dumps(result, ensure_ascii=False)
+            else:
+                raise
+        
+        result = {
+            "status": "success",
+            "message": f"Файл успешно загружен на сервер: {remote_path}",
+            "remote_path": remote_path
+        }
+        return json.dumps(result, ensure_ascii=False)
+        
+    except Exception as e:
+        result = {
+            "status": "error",
+            "message": f"Ошибка при загрузке файла: {str(e)}"
+        }
+        return json.dumps(result, ensure_ascii=False)
+    finally:
+        if ssh_client:
+            ssh_client.close()
+
+
+@mcp.tool()
+def deploy_load_image(host: str, port: int, username: str, password: str, image_tar_path: str) -> str:
+    """Загружает Docker image в Docker на сервере.
+    
+    Args:
+        host: SSH host сервера
+        port: SSH port (обычно 22)
+        username: SSH username
+        password: SSH password
+        image_tar_path: Путь к .tar файлу на сервере
+    
+    Returns:
+        JSON строка с результатом загрузки образа
+    """
+    ssh_client = None
+    try:
+        ssh_client = _create_ssh_client(host, port, username, password)
+        
+        # Извлекаем имя образа из пути (например, nikita-ai:latest)
+        # Пробуем определить имя образа из вывода docker load
+        # Сначала проверяем, есть ли уже такой образ
+        check_cmd = "sudo docker images --format '{{.Repository}}:{{.Tag}}' | grep -E 'nikita-ai|nikita_ai' | head -1"
+        stdin, stdout, stderr = ssh_client.exec_command(check_cmd)
+        existing_image = stdout.read().decode().strip()
+        
+        # Загружаем образ в Docker (docker load автоматически обновит существующий образ)
+        cmd = f"sudo docker load -i {image_tar_path}"
+        stdin, stdout, stderr = ssh_client.exec_command(cmd)
+        exit_status = stdout.channel.recv_exit_status()
+        output = stdout.read().decode()
+        error_output = stderr.read().decode()
+        
+        if exit_status != 0:
+            result = {
+                "status": "error",
+                "message": f"Ошибка при загрузке образа: {error_output}",
+                "exit_status": exit_status
+            }
+        else:
+            # Определяем, был ли образ обновлен или создан новый
+            loaded_image = output.split("Loaded image: ")[-1].strip() if "Loaded image:" in output else ""
+            if existing_image and loaded_image:
+                message = f"Образ обновлен в Docker: {loaded_image}"
+            elif loaded_image:
+                message = f"Образ загружен в Docker: {loaded_image}"
+            else:
+                message = "Образ успешно загружен/обновлен в Docker"
+            
+            result = {
+                "status": "success",
+                "message": message,
+                "output": output
+            }
+        
+        return json.dumps(result, ensure_ascii=False)
+        
+    except Exception as e:
+        result = {
+            "status": "error",
+            "message": f"Ошибка при загрузке образа: {str(e)}"
+        }
+        return json.dumps(result, ensure_ascii=False)
+    finally:
+        if ssh_client:
+            ssh_client.close()
+
+
+@mcp.tool()
+def deploy_create_compose(host: str, port: int, username: str, password: str, compose_content: str, remote_path: str = "/opt/nikita_ai/docker-compose.yml") -> str:
+    """Создает или обновляет docker-compose.yml на сервере.
+    
+    Args:
+        host: SSH host сервера
+        port: SSH port (обычно 22)
+        username: SSH username
+        password: SSH password
+        compose_content: YAML содержимое docker-compose.yml
+        remote_path: Путь на сервере для сохранения файла (по умолчанию /opt/nikita_ai/docker-compose.yml)
+    
+    Returns:
+        JSON строка с результатом создания/обновления файла
+    """
+    ssh_client = None
+    try:
+        ssh_client = _create_ssh_client(host, port, username, password)
+        
+        # Создаем директорию, если не существует
+        # Нормализуем пути для Linux (заменяем обратные слеши на прямые)
+        remote_path = remote_path.replace('\\', '/')
+        remote_dir = str(Path(remote_path).parent).replace('\\', '/')
+        stdin, stdout, stderr = ssh_client.exec_command(f"mkdir -p '{remote_dir}'")
+        stdout.channel.recv_exit_status()
+        
+        # Создаем временный файл локально и загружаем его
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.yml', delete=False) as tmp_file:
+            tmp_file.write(compose_content)
+            tmp_path = tmp_file.name
+        
+        try:
+            # Проверяем, существует ли файл и отличается ли содержимое
+            check_cmd = f"test -f '{remote_path}' && echo 'exists' || echo 'not_exists'"
+            stdin, stdout, stderr = ssh_client.exec_command(check_cmd)
+            file_exists = stdout.read().decode().strip()
+            
+            if file_exists == "exists":
+                # Сравниваем содержимое (читаем удаленный файл)
+                read_cmd = f"cat '{remote_path}' 2>&1"
+                stdin, stdout, stderr = ssh_client.exec_command(read_cmd)
+                remote_content = stdout.read().decode()
+                
+                if remote_content.strip() == compose_content.strip():
+                    result = {
+                        "status": "success",
+                        "message": f"docker-compose.yml уже актуален (без изменений): {remote_path}",
+                        "remote_path": remote_path,
+                        "skipped": True
+                    }
+                    return json.dumps(result, ensure_ascii=False)
+            
+            # Файл не существует или содержимое отличается - обновляем
+            with SCPClient(ssh_client.get_transport()) as scp:
+                scp.put(tmp_path, remote_path)
+            
+            action = "обновлен" if file_exists == "exists" else "создан"
+            result = {
+                "status": "success",
+                "message": f"docker-compose.yml успешно {action}: {remote_path}",
+                "remote_path": remote_path,
+                "skipped": False
+            }
+        finally:
+            # Удаляем временный файл
+            os.unlink(tmp_path)
+        
+        return json.dumps(result, ensure_ascii=False)
+        
+    except Exception as e:
+        result = {
+            "status": "error",
+            "message": f"Ошибка при создании docker-compose.yml: {str(e)}"
+        }
+        return json.dumps(result, ensure_ascii=False)
+    finally:
+        if ssh_client:
+            ssh_client.close()
+
+
+@mcp.tool()
+def deploy_create_env(host: str, port: int, username: str, password: str, env_content: str, remote_path: str = "/opt/nikita_ai/.env") -> str:
+    """Создает или обновляет .env файл на сервере.
+    
+    Args:
+        host: SSH host сервера
+        port: SSH port (обычно 22)
+        username: SSH username
+        password: SSH password
+        env_content: Содержимое .env файла
+        remote_path: Путь на сервере для сохранения файла (по умолчанию /opt/nikita_ai/.env)
+    
+    Returns:
+        JSON строка с результатом создания/обновления файла
+    """
+    ssh_client = None
+    try:
+        ssh_client = _create_ssh_client(host, port, username, password)
+        
+        # Создаем директорию, если не существует
+        remote_dir = str(Path(remote_path).parent).replace('\\', '/')
+        remote_path = remote_path.replace('\\', '/')
+        
+        # Получаем имя текущего пользователя
+        whoami_cmd = "whoami"
+        stdin, stdout, stderr = ssh_client.exec_command(whoami_cmd)
+        current_user = stdout.read().decode().strip()
+        
+        # Создаем директорию
+        mkdir_cmd = f"sudo mkdir -p '{remote_dir}'"
+        stdin, stdout, stderr = ssh_client.exec_command(mkdir_cmd)
+        stdout.channel.recv_exit_status()
+        
+        # Загружаем .env файл во временную директорию, затем перемещаем
+        temp_env_path = f"/tmp/.env_{os.urandom(8).hex()}"
+        
+        # Создаем временный файл локально и загружаем его
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.env', delete=False, encoding='utf-8') as tmp_file:
+            tmp_file.write(env_content)
+            tmp_path = tmp_file.name
+        
+        try:
+            # Загружаем во временную директорию
+            with SCPClient(ssh_client.get_transport()) as scp:
+                scp.put(tmp_path, temp_env_path)
+            
+            # Проверяем, существует ли файл и отличается ли содержимое
+            check_cmd = f"test -f '{remote_path}' && echo 'exists' || echo 'not_exists'"
+            stdin, stdout, stderr = ssh_client.exec_command(check_cmd)
+            file_exists = stdout.read().decode().strip()
+            
+            if file_exists == "exists":
+                # Сравниваем содержимое (читаем удаленный файл)
+                read_cmd = f"sudo cat '{remote_path}' 2>&1"
+                stdin, stdout, stderr = ssh_client.exec_command(read_cmd)
+                remote_content = stdout.read().decode()
+                
+                if remote_content.strip() == env_content.strip():
+                    # Удаляем временный файл
+                    rm_cmd = f"rm -f '{temp_env_path}'"
+                    stdin, stdout, stderr = ssh_client.exec_command(rm_cmd)
+                    stdout.channel.recv_exit_status()
+                    
+                    result = {
+                        "status": "success",
+                        "message": f".env файл уже актуален (без изменений): {remote_path}",
+                        "remote_path": remote_path,
+                        "skipped": True
+                    }
+                    return json.dumps(result, ensure_ascii=False)
+            
+            # Файл не существует или содержимое отличается - обновляем
+            # Перемещаем через sudo
+            mv_cmd = f"sudo cat '{temp_env_path}' | sudo tee '{remote_path}' > /dev/null && sudo chown {current_user}:{current_user} '{remote_path}' && sudo chmod 644 '{remote_path}'"
+            stdin, stdout, stderr = ssh_client.exec_command(mv_cmd)
+            exit_status = stdout.channel.recv_exit_status()
+            
+            if exit_status != 0:
+                error_output = stderr.read().decode()
+                result = {
+                    "status": "error",
+                    "message": f"Не удалось переместить .env файл: {error_output}"
+                }
+                return json.dumps(result, ensure_ascii=False)
+            
+            # Удаляем временный файл
+            rm_cmd = f"rm -f '{temp_env_path}'"
+            stdin, stdout, stderr = ssh_client.exec_command(rm_cmd)
+            stdout.channel.recv_exit_status()
+            
+            action = "обновлен" if file_exists == "exists" else "создан"
+            result = {
+                "status": "success",
+                "message": f".env файл успешно {action}: {remote_path}",
+                "remote_path": remote_path,
+                "skipped": False
+            }
+        finally:
+            # Удаляем временный файл
+            os.unlink(tmp_path)
+        
+        return json.dumps(result, ensure_ascii=False)
+        
+    except Exception as e:
+        result = {
+            "status": "error",
+            "message": f"Ошибка при создании .env файла: {str(e)}"
+        }
+        return json.dumps(result, ensure_ascii=False)
+    finally:
+        if ssh_client:
+            ssh_client.close()
+
+
+@mcp.tool()
+def deploy_read_env(host: str, port: int, username: str, password: str, env_path: str = "/opt/nikita_ai/.env") -> str:
+    """Читает содержимое .env файла на сервере (без паролей, только имена переменных).
+    
+    Args:
+        host: SSH host сервера
+        port: SSH port (обычно 22)
+        username: SSH username
+        password: SSH password
+        env_path: Путь к .env файлу на сервере
+    
+    Returns:
+        JSON строка с содержимым .env файла (токены скрыты)
+    """
+    ssh_client = None
+    try:
+        ssh_client = _create_ssh_client(host, port, username, password)
+        
+        # Читаем .env файл
+        cat_cmd = f"sudo cat '{env_path}' 2>&1 || cat '{env_path}' 2>&1"
+        stdin, stdout, stderr = ssh_client.exec_command(cat_cmd)
+        exit_status = stdout.channel.recv_exit_status()
+        env_content = stdout.read().decode()
+        env_error = stderr.read().decode()
+        
+        if exit_status != 0:
+            result = {
+                "status": "error",
+                "message": f"Не удалось прочитать .env файл: {env_error}"
+            }
+            return json.dumps(result, ensure_ascii=False)
+        
+        # Скрываем чувствительные данные (оставляем только первые и последние символы)
+        lines = env_content.split('\n')
+        safe_lines = []
+        for line in lines:
+            if '=' in line:
+                key, value = line.split('=', 1)
+                if 'TOKEN' in key.upper() or 'PASSWORD' in key.upper() or 'KEY' in key.upper():
+                    if len(value) > 10:
+                        safe_value = value[:4] + "..." + value[-4:]
+                    else:
+                        safe_value = "***"
+                    safe_lines.append(f"{key}={safe_value}")
+                else:
+                    safe_lines.append(line)
+            else:
+                safe_lines.append(line)
+        
+        result = {
+            "status": "success",
+            "content": "\n".join(safe_lines),
+            "has_token": "TELEGRAM_BOT_TOKEN" in env_content
+        }
+        return json.dumps(result, ensure_ascii=False)
+        
+    except Exception as e:
+        result = {
+            "status": "error",
+            "message": f"Ошибка при чтении .env файла: {str(e)}"
+        }
+        return json.dumps(result, ensure_ascii=False)
+    finally:
+        if ssh_client:
+            ssh_client.close()
+
+
+@mcp.tool()
+def deploy_check_container(host: str, port: int, username: str, password: str, container_name: str = "nikita_ai_bot") -> str:
+    """Проверяет статус контейнера и возвращает его логи.
+    
+    Args:
+        host: SSH host сервера
+        port: SSH port (обычно 22)
+        username: SSH username
+        password: SSH password
+        container_name: Имя контейнера (по умолчанию nikita_ai_bot)
+    
+    Returns:
+        JSON строка с результатом проверки и логами
+    """
+    ssh_client = None
+    try:
+        ssh_client = _create_ssh_client(host, port, username, password)
+        
+        # Сначала проверяем все контейнеры с похожим именем
+        list_cmd = f"sudo docker ps -a --filter 'name={container_name}' --format '{{{{.Names}}}}\\t{{{{.Status}}}}\\t{{{{.ID}}}}'"
+        stdin, stdout, stderr = ssh_client.exec_command(list_cmd)
+        list_output = stdout.read().decode().strip()
+        list_error = stderr.read().decode()
+        
+        # Проверяем статус контейнера (берем первый найденный)
+        status_cmd = f"sudo docker ps -a --filter 'name={container_name}' --format '{{{{.Status}}}}' | head -1"
+        stdin, stdout, stderr = ssh_client.exec_command(status_cmd)
+        exit_status = stdout.channel.recv_exit_status()
+        status_output = stdout.read().decode().strip()
+        status_error = stderr.read().decode()
+        
+        # Получаем ID контейнера
+        id_cmd = f"sudo docker ps -a --filter 'name={container_name}' --format '{{{{.ID}}}}' | head -1"
+        stdin, stdout, stderr = ssh_client.exec_command(id_cmd)
+        container_id = stdout.read().decode().strip()
+        
+        logs_output = ""
+        logs_error = ""
+        
+        # Пробуем получить логи по имени
+        if container_name:
+            logs_cmd = f"sudo docker logs --tail 100 '{container_name}' 2>&1"
+            stdin, stdout, stderr = ssh_client.exec_command(logs_cmd)
+            logs_output = stdout.read().decode()
+            logs_error = stderr.read().decode()
+        
+        # Если не получилось по имени, пробуем по ID
+        if not logs_output and not logs_error and container_id:
+            logs_cmd = f"sudo docker logs --tail 100 '{container_id}' 2>&1"
+            stdin, stdout, stderr = ssh_client.exec_command(logs_cmd)
+            logs_output = stdout.read().decode()
+            logs_error = stderr.read().decode()
+        
+        # Если все еще нет логов, пробуем найти любой контейнер с nikita_ai
+        if not logs_output and not logs_error:
+            find_cmd = f"sudo docker ps -a | grep nikita_ai | head -1 | awk '{{print $1}}'"
+            stdin, stdout, stderr = ssh_client.exec_command(find_cmd)
+            found_id = stdout.read().decode().strip()
+            if found_id:
+                logs_cmd = f"sudo docker logs --tail 100 '{found_id}' 2>&1"
+                stdin, stdout, stderr = ssh_client.exec_command(logs_cmd)
+                logs_output = stdout.read().decode()
+                logs_error = stderr.read().decode()
+        
+        result = {
+            "status": "success",
+            "container_status": status_output or "не найден",
+            "container_list": list_output or "нет контейнеров",
+            "container_id": container_id or "не найден",
+            "logs": logs_output or logs_error or "логи недоступны (контейнер может быть еще не запущен)"
+        }
+        
+        return json.dumps(result, ensure_ascii=False)
+        
+    except Exception as e:
+        result = {
+            "status": "error",
+            "message": f"Ошибка при проверке контейнера: {str(e)}"
+        }
+        return json.dumps(result, ensure_ascii=False)
+    finally:
+        if ssh_client:
+            ssh_client.close()
+
+
+@mcp.tool()
+def deploy_start_bot(host: str, port: int, username: str, password: str, compose_path: str = "/opt/nikita_ai/docker-compose.yml") -> str:
+    """Запускает бота через docker-compose на сервере.
+    
+    Args:
+        host: SSH host сервера
+        port: SSH port (обычно 22)
+        username: SSH username
+        password: SSH password
+        compose_path: Путь к docker-compose.yml на сервере (по умолчанию /opt/nikita_ai/docker-compose.yml)
+    
+    Returns:
+        JSON строка с результатом запуска
+    """
+    ssh_client = None
+    try:
+        ssh_client = _create_ssh_client(host, port, username, password)
+        
+        # Нормализуем пути для Linux (заменяем обратные слеши на прямые)
+        compose_path = compose_path.replace('\\', '/')
+        compose_dir = str(Path(compose_path).parent).replace('\\', '/')
+        
+        # Останавливаем существующие контейнеры
+        # Останавливаем и удаляем старые контейнеры (включая orphaned)
+        cmd_down = f"cd '{compose_dir}' && sudo docker compose -f '{compose_path}' down --remove-orphans"
+        stdin, stdout, stderr = ssh_client.exec_command(cmd_down)
+        stdout.channel.recv_exit_status()  # Игнорируем ошибки, если контейнеры не запущены
+        
+        # Удаляем все старые контейнеры с именем nikita_ai_bot (на случай, если они остались)
+        cleanup_cmd = "sudo docker ps -a --filter 'name=nikita_ai_bot' --format '{{.ID}}' | xargs -r sudo docker rm -f"
+        stdin, stdout, stderr = ssh_client.exec_command(cleanup_cmd)
+        stdout.channel.recv_exit_status()  # Игнорируем ошибки
+        
+        # Получаем имя текущего пользователя
+        whoami_cmd = "whoami"
+        stdin, stdout, stderr = ssh_client.exec_command(whoami_cmd)
+        current_user = stdout.read().decode().strip()
+        
+        # Создаем директории для данных
+        # Создаем директорию data для монтирования в /app/data (для базы данных)
+        data_dir = f"{compose_dir}/data"
+        mkdir_data_cmd = f"sudo mkdir -p '{data_dir}' && sudo chmod 777 '{data_dir}'"
+        stdin, stdout, stderr = ssh_client.exec_command(mkdir_data_cmd)
+        stdout.channel.recv_exit_status()  # Игнорируем ошибки
+        
+        # Создаем директорию для digests
+        mkdir_cmd = f"sudo mkdir -p '{compose_dir}/digests' && sudo chmod 777 '{compose_dir}/digests'"
+        stdin, stdout, stderr = ssh_client.exec_command(mkdir_cmd)
+        stdout.channel.recv_exit_status()  # Игнорируем ошибки
+        
+        # Файл базы данных будет создан автоматически SQLite в директории /app/data
+        # Не нужно создавать его заранее, SQLite создаст его сам
+        
+        # Запускаем контейнеры
+        cmd_up = f"cd '{compose_dir}' && sudo docker compose -f '{compose_path}' up -d"
+        stdin, stdout, stderr = ssh_client.exec_command(cmd_up)
+        exit_status = stdout.channel.recv_exit_status()
+        output = stdout.read().decode()
+        error_output = stderr.read().decode()
+        
+        if exit_status != 0:
+            result = {
+                "status": "error",
+                "message": f"Ошибка при запуске бота: {error_output}",
+                "exit_status": exit_status
+            }
+        else:
+            result = {
+                "status": "success",
+                "message": "Бот успешно запущен",
+                "output": output
+            }
+        
+        return json.dumps(result, ensure_ascii=False)
+        
+    except Exception as e:
+        result = {
+            "status": "error",
+            "message": f"Ошибка при запуске бота: {str(e)}"
+        }
+        return json.dumps(result, ensure_ascii=False)
+    finally:
+        if ssh_client:
+            ssh_client.close()
 
 
 # Add a dynamic greeting resource

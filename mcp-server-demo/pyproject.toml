@@ -8,6 +8,8 @@ dependencies = [
     "mcp[cli]",
     "google-api-python-client",
     "google-auth",
+    "paramiko",
+    "scp",
 ]
 
 [tool.uv.sources]
