@@ -1828,16 +1828,42 @@ async def task_delete(row_number: int) -> str:
 
 # ==================== DEPLOY TOOLS ====================
 
-def _create_ssh_client(host: str, port: int, username: str, password: str) -> paramiko.SSHClient:
-    """Создает и подключается к SSH клиенту."""
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    try:
-        client.connect(hostname=host, port=port, username=username, password=password, timeout=30)
-        return client
-    except Exception as e:
-        client.close()
-        raise Exception(f"Ошибка подключения к SSH: {e}")
+def _create_ssh_client(host: str, port: int, username: str, password: str, retries: int = 3) -> paramiko.SSHClient:
+    """Создает и подключается к SSH клиенту с повторными попытками."""
+    last_error = None
+    for attempt in range(retries):
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            # Увеличиваем таймаут и добавляем keepalive для поддержания соединения
+            client.connect(
+                hostname=host,
+                port=port,
+                username=username,
+                password=password,
+                timeout=60,  # Увеличенный таймаут
+                look_for_keys=False,
+                allow_agent=False,
+                compress=True  # Сжатие для ускорения
+            )
+            # Настраиваем keepalive для поддержания соединения
+            transport = client.get_transport()
+            if transport:
+                transport.set_keepalive(30)  # Отправлять keepalive каждые 30 секунд
+            return client
+        except Exception as e:
+            last_error = e
+            try:
+                client.close()
+            except:
+                pass
+            if attempt < retries - 1:
+                import time
+                time.sleep(2)  # Ждем перед повторной попыткой
+            else:
+                raise Exception(f"Ошибка подключения к SSH после {retries} попыток: {e}")
+    
+    raise Exception(f"Ошибка подключения к SSH: {last_error}")
 
 
 @mcp.tool()
@@ -2333,19 +2359,35 @@ def deploy_create_env(host: str, port: int, username: str, password: str, env_co
     try:
         ssh_client = _create_ssh_client(host, port, username, password)
         
+        # Проверяем, что соединение активно
+        try:
+            transport = ssh_client.get_transport()
+            if transport and not transport.is_active():
+                raise Exception("SSH соединение неактивно")
+        except Exception as conn_check_error:
+            # Переподключаемся, если соединение разорвано
+            ssh_client.close()
+            ssh_client = _create_ssh_client(host, port, username, password)
+        
         # Создаем директорию, если не существует
         remote_dir = str(Path(remote_path).parent).replace('\\', '/')
         remote_path = remote_path.replace('\\', '/')
         
         # Получаем имя текущего пользователя
         whoami_cmd = "whoami"
-        stdin, stdout, stderr = ssh_client.exec_command(whoami_cmd)
+        stdin, stdout, stderr = ssh_client.exec_command(whoami_cmd, timeout=30)
+        exit_status = stdout.channel.recv_exit_status()
+        if exit_status != 0:
+            raise Exception(f"Не удалось выполнить команду whoami: {stderr.read().decode()}")
         current_user = stdout.read().decode().strip()
         
         # Создаем директорию
         mkdir_cmd = f"sudo mkdir -p '{remote_dir}'"
-        stdin, stdout, stderr = ssh_client.exec_command(mkdir_cmd)
-        stdout.channel.recv_exit_status()
+        stdin, stdout, stderr = ssh_client.exec_command(mkdir_cmd, timeout=30)
+        exit_status = stdout.channel.recv_exit_status()
+        if exit_status != 0:
+            error_msg = stderr.read().decode()
+            raise Exception(f"Не удалось создать директорию: {error_msg}")
         
         # Загружаем .env файл во временную директорию, затем перемещаем
         temp_env_path = f"/tmp/.env_{os.urandom(8).hex()}"
@@ -2358,18 +2400,31 @@ def deploy_create_env(host: str, port: int, username: str, password: str, env_co
         
         try:
             # Загружаем во временную директорию
-            with SCPClient(ssh_client.get_transport()) as scp:
+            # Проверяем соединение перед SCP
+            transport = ssh_client.get_transport()
+            if not transport or not transport.is_active():
+                ssh_client.close()
+                ssh_client = _create_ssh_client(host, port, username, password)
+                transport = ssh_client.get_transport()
+            
+            with SCPClient(transport) as scp:
                 scp.put(tmp_path, temp_env_path)
             
             # Проверяем, существует ли файл и отличается ли содержимое
             check_cmd = f"test -f '{remote_path}' && echo 'exists' || echo 'not_exists'"
-            stdin, stdout, stderr = ssh_client.exec_command(check_cmd)
+            stdin, stdout, stderr = ssh_client.exec_command(check_cmd, timeout=30)
+            exit_status = stdout.channel.recv_exit_status()
+            if exit_status != 0:
+                raise Exception(f"Не удалось проверить существование файла: {stderr.read().decode()}")
             file_exists = stdout.read().decode().strip()
             
             if file_exists == "exists":
                 # Сравниваем содержимое (читаем удаленный файл)
                 read_cmd = f"sudo cat '{remote_path}' 2>&1"
-                stdin, stdout, stderr = ssh_client.exec_command(read_cmd)
+                stdin, stdout, stderr = ssh_client.exec_command(read_cmd, timeout=30)
+                exit_status = stdout.channel.recv_exit_status()
+                if exit_status != 0:
+                    raise Exception(f"Не удалось прочитать файл: {stderr.read().decode()}")
                 remote_content = stdout.read().decode()
                 
                 if remote_content.strip() == env_content.strip():
@@ -2389,7 +2444,7 @@ def deploy_create_env(host: str, port: int, username: str, password: str, env_co
             # Файл не существует или содержимое отличается - обновляем
             # Перемещаем через sudo
             mv_cmd = f"sudo cat '{temp_env_path}' | sudo tee '{remote_path}' > /dev/null && sudo chown {current_user}:{current_user} '{remote_path}' && sudo chmod 644 '{remote_path}'"
-            stdin, stdout, stderr = ssh_client.exec_command(mv_cmd)
+            stdin, stdout, stderr = ssh_client.exec_command(mv_cmd, timeout=60)
             exit_status = stdout.channel.recv_exit_status()
             
             if exit_status != 0:
@@ -2574,6 +2629,93 @@ def deploy_check_container(host: str, port: int, username: str, password: str, c
         result = {
             "status": "error",
             "message": f"Ошибка при проверке контейнера: {str(e)}"
+        }
+        return json.dumps(result, ensure_ascii=False)
+    finally:
+        if ssh_client:
+            ssh_client.close()
+
+
+@mcp.tool()
+def deploy_stop_bot(host: str, port: int, username: str, password: str, compose_path: str = "/opt/nikita_ai/docker-compose.yml", remove_volumes: bool = False, remove_images: bool = False) -> str:
+    """Останавливает и удаляет бота с сервера.
+    
+    Args:
+        host: SSH host сервера
+        port: SSH port (обычно 22)
+        username: SSH username
+        password: SSH password
+        compose_path: Путь к docker-compose.yml на сервере (по умолчанию /opt/nikita_ai/docker-compose.yml)
+        remove_volumes: Удалять ли volumes (данные базы данных и digests) (по умолчанию False)
+        remove_images: Удалять ли Docker образы (по умолчанию False)
+    
+    Returns:
+        JSON строка с результатом остановки и удаления
+    """
+    ssh_client = None
+    try:
+        ssh_client = _create_ssh_client(host, port, username, password)
+        
+        # Нормализуем пути для Linux
+        compose_path = compose_path.replace('\\', '/')
+        compose_dir = str(Path(compose_path).parent).replace('\\', '/')
+        
+        results = []
+        
+        # 1. Останавливаем и удаляем контейнеры через docker-compose
+        cmd_down = f"cd '{compose_dir}' && sudo docker compose -f '{compose_path}' down --remove-orphans"
+        if remove_volumes:
+            cmd_down += " -v"
+        
+        stdin, stdout, stderr = ssh_client.exec_command(cmd_down)
+        exit_status = stdout.channel.recv_exit_status()
+        output = stdout.read().decode()
+        error_output = stderr.read().decode()
+        
+        if exit_status == 0:
+            results.append("Контейнеры остановлены и удалены")
+        else:
+            # Игнорируем ошибки, если контейнеры уже не запущены
+            if "No such service" not in error_output and "not found" not in error_output.lower():
+                results.append(f"Предупреждение при остановке контейнеров: {error_output}")
+            else:
+                results.append("Контейнеры уже были остановлены")
+        
+        # 2. Удаляем все контейнеры с именем nikita_ai_bot (на случай, если они остались)
+        cleanup_cmd = "sudo docker ps -a --filter 'name=nikita_ai_bot' --format '{{.ID}}' | xargs -r sudo docker rm -f"
+        stdin, stdout, stderr = ssh_client.exec_command(cleanup_cmd)
+        stdout.channel.recv_exit_status()  # Игнорируем ошибки
+        
+        # 3. Удаляем образы, если указано
+        if remove_images:
+            images_cmd = "sudo docker images --filter 'reference=nikita-ai*' --format '{{.ID}}' | xargs -r sudo docker rmi -f"
+            stdin, stdout, stderr = ssh_client.exec_command(images_cmd)
+            exit_status = stdout.channel.recv_exit_status()
+            if exit_status == 0:
+                results.append("Docker образы удалены")
+            else:
+                results.append("Docker образы не найдены или уже удалены")
+        
+        # 4. Удаляем файлы, если указано remove_volumes
+        if remove_volumes:
+            # Удаляем docker-compose.yml, .env, данные
+            rm_files_cmd = f"sudo rm -rf '{compose_dir}/docker-compose.yml' '{compose_dir}/.env' '{compose_dir}/data' '{compose_dir}/digests' '{compose_dir}/*.tar'"
+            stdin, stdout, stderr = ssh_client.exec_command(rm_files_cmd)
+            stdout.channel.recv_exit_status()  # Игнорируем ошибки
+            results.append("Файлы конфигурации и данные удалены")
+        
+        result = {
+            "status": "success",
+            "message": "Бот успешно остановлен и удален",
+            "details": results
+        }
+        
+        return json.dumps(result, ensure_ascii=False)
+        
+    except Exception as e:
+        result = {
+            "status": "error",
+            "message": f"Ошибка при остановке бота: {str(e)}"
         }
         return json.dumps(result, ensure_ascii=False)
     finally:
