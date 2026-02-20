@@ -1857,10 +1857,17 @@ def _create_ssh_client(host: str, port: int, username: str, password: str, retri
                 client.close()
             except:
                 pass
+            # Увеличиваем задержку для ошибок чтения banner (часто из-за медленного ответа сервера)
+            error_msg = str(e)
+            is_banner_error = "Error reading SSH protocol banner" in error_msg or isinstance(e, paramiko.ssh_exception.SSHException)
+            
             if attempt < retries - 1:
                 import time
-                time.sleep(2)  # Ждем перед повторной попыткой
+                # Увеличиваем задержку между попытками для banner ошибок
+                delay = 3 if is_banner_error else 2
+                time.sleep(delay)
             else:
+                # На последней попытке поднимаем исключение
                 raise Exception(f"Ошибка подключения к SSH после {retries} попыток: {e}")
     
     raise Exception(f"Ошибка подключения к SSH: {last_error}")
